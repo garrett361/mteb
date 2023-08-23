@@ -1,0 +1,3 @@
+FROM garrettgoon/mteb_det
+WORKDIR /
+COPY ./mteb/ mteb/
