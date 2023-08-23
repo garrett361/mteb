@@ -145,3 +145,5 @@ error_logs.txt
 #Model binaries
 *.bin
 *.pt
+# test results
+test_results/
