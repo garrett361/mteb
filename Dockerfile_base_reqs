@@ -1,8 +1,7 @@
 FROM determinedai/environments:cuda-11.8-pytorch-2.0-gpu-mpi-0.24.0
 WORKDIR /
-COPY ./mteb/ mteb/
-COPY setup.py .
-RUN pip install -e .
-RUN rm -rf mteb/
+COPY . mteb/
+WORKDIR mteb/
+RUN pip install -e ".[beir]"
 
 

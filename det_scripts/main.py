@@ -1,16 +1,19 @@
 from typing import Any, Dict
 
 import determined as det
+import torch
 from sentence_transformers import SentenceTransformer
 
 from mteb import MTEB
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
     # Define the sentence-transformers model name
     model_name = hparams["model_name"]
 
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device=device)
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
         task_types=hparams.get("task_types"),

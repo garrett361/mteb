@@ -7,6 +7,7 @@ environment:
   image:
     gpu: garrettgoon/mteb_det
     cpu: garrettgoon/mteb_det
+  force_pull_image: True
 resources:
   slots_per_trial: 1
 searcher:
@@ -20,5 +21,5 @@ hyperparameters:
     - Banking77Classification
 entrypoint: >-
   python -m determined.launch.torch_distributed
-  python mteb/det_scripts/main.py
+  python main.py
 max_restarts: 0
