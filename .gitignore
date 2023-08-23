@@ -141,3 +141,7 @@ dmypy.json
 
 # error logs
 error_logs.txt
+
+#Model binaries
+*.bin
+*.pt
