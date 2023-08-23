@@ -1,3 +1,5 @@
+import time
+
 from sentence_transformers import SentenceTransformer
 
 from mteb import MTEB
@@ -9,5 +11,7 @@ def test_basic_results():
 
     model = SentenceTransformer(model_name)
     evaluation = MTEB(tasks=["Banking77Classification"])
-    results = evaluation.run(model, output_folder=f"test_results/{model_name}")
+    # Create a unique output folder; the evaluation exits early if the output dir already exists
+    output_folder = f"tests/test_results/{model_name}_" + f"{str(int(time.time()))}"
+    results = evaluation.run(model, output_folder=output_folder)
     assert results

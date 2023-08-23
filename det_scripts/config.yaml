@@ -1,0 +1,24 @@
+name: mteb testing
+environment:
+  environment_variables:
+    - NCCL_DEBUG=INFO
+    # You may need to modify this to match your network configuration.
+    - NCCL_SOCKET_IFNAME=ens,eth,ib
+  image:
+    gpu: garrettgoon/mteb_det
+    cpu: garrettgoon/mteb_det
+resources:
+  slots_per_trial: 1
+searcher:
+  name: single
+  max_length:
+    batches: 1
+  metric: arbitrary
+hyperparameters:
+  model_name: average_word_embeddings_komninos
+  tasks:
+    - Banking77Classification
+entrypoint: >-
+  python -m determined.launch.torch_distributed
+  python mteb/det_scripts/main.py
+max_restarts: 0
