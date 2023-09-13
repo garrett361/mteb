@@ -3,7 +3,7 @@ requires = ["pbr>=5.7.0", "setuptools>=36.6.0"]
 build-backend = "pbr.build"
 
 [tool.black]
-line-length = 119
+line-length = 110
 target-version = ['py35']
 
 [tool.isort]
