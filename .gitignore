@@ -147,3 +147,7 @@ error_logs.txt
 *.pt
 # test results
 test_results/
+
+
+# configs for dev work
+_dev_configs/
