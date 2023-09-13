@@ -81,7 +81,8 @@ setup(
         "torch",
         "tqdm",
         "rich",
-        "determined==0.25.0",
+        "determined==0.25.1",
+        "wandb==0.15.10",
     ],
     extras_require=extras,
     classifiers=[
