@@ -26,7 +26,8 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
         for res_name, res_val in res_dict.items():
             metrics[task + "_" + res_name] = res_val
 
-    core_context.train.report_validation_metrics(steps_completed=1, metrics=metrics)
+    if core_context.distributed.rank == 0:
+        core_context.train.report_validation_metrics(steps_completed=1, metrics=metrics)
 
 
 if __name__ == "__main__":
