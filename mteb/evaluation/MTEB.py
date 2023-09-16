@@ -8,6 +8,7 @@ from time import time
 from typing import List, Union
 
 import datasets
+import wandb
 from rich.console import Console
 
 from .. import __version__
@@ -109,7 +110,8 @@ class MTEB:
         if name:
             console.rule(f"[bold]{name}\n", style="grey15")
         for task_type in self.available_task_types:
-            current_type_tasks = list(filter(lambda x: x.description["type"] == task_type, task_list))
+            current_type_tasks = list(
+                filter(lambda x: x.description["type"] == task_type, task_list))
             if len(current_type_tasks) == 0:
                 continue
             else:
@@ -128,8 +130,10 @@ class MTEB:
                         if task.is_crosslingual
                         else ""
                     )
-                    beir = ", [italic yellow]beir[/]" if task.description.get("beir_name", False) else ""
-                    console.print(f"{prefix}{name}{beir}{category}{multilingual}{crosslingual}")
+                    beir = ", [italic yellow]beir[/]" if task.description.get(
+                        "beir_name", False) else ""
+                    console.print(
+                        f"{prefix}{name}{beir}{category}{multilingual}{crosslingual}")
                 console.print("\n")
 
     @classmethod
@@ -159,30 +163,38 @@ class MTEB:
 
         # If `task_list` is specified, select list of tasks
         if self._tasks is not None:
-            self.tasks = list(filter(lambda x: (x.description["name"] in self._tasks), self.tasks_cls))
+            self.tasks = list(
+                filter(lambda x: (x.description["name"] in self._tasks), self.tasks_cls))
             if len(self.tasks) != len(self._tasks):
-                tasks_known = set([x.description["name"] for x in self.tasks_cls])
-                tasks_unknown = set(x for x in self._tasks if isinstance(x, str)) - tasks_known
+                tasks_known = set([x.description["name"]
+                                  for x in self.tasks_cls])
+                tasks_unknown = set(
+                    x for x in self._tasks if isinstance(x, str)) - tasks_known
                 if tasks_unknown:
                     unknown_str, known_str = ",".join(sorted(list(tasks_unknown))), ",".join(
                         sorted(list(tasks_known))
                     )
-                    logger.warning(f"WARNING: Unknown tasks: {unknown_str}. Known tasks: {known_str}.")
+                    logger.warning(
+                        f"WARNING: Unknown tasks: {unknown_str}. Known tasks: {known_str}.")
             # add task if subclass of mteb.tasks
-            self.tasks.extend([x for x in self._tasks if isinstance(x, AbsTask)])
+            self.tasks.extend(
+                [x for x in self._tasks if isinstance(x, AbsTask)])
             return
 
         # Otherwise use filters to select tasks
         filtered_tasks = filter(
-            lambda x: (self._task_types is None) or (x.description["type"] in self._task_types),
+            lambda x: (self._task_types is None) or (
+                x.description["type"] in self._task_types),
             self.tasks_cls,
         )
         filtered_tasks = filter(
-            lambda x: (self._task_categories is None) or (x.description["category"] in self._task_categories),
+            lambda x: (self._task_categories is None) or (
+                x.description["category"] in self._task_categories),
             filtered_tasks,
         )
         filtered_tasks = filter(
-            lambda x: (self._version is None) or (x.description["version"] >= self._version), filtered_tasks
+            lambda x: (self._version is None) or (
+                x.description["version"] >= self._version), filtered_tasks
         )
         # keep only tasks with at least one language in the filter
         filtered_tasks = filter(
@@ -252,15 +264,18 @@ class MTEB:
 
             # skip evaluation if results folder exists and overwrite_results is False
             if output_folder is not None:
-                save_path = os.path.join(output_folder, f"{task.description['name']}{task.save_suffix}.json")
+                save_path = os.path.join(
+                    output_folder, f"{task.description['name']}{task.save_suffix}.json")
                 if os.path.exists(save_path) and overwrite_results is False:
-                    logger.warning(f"WARNING: {task.description['name']} results already exists. Skipping.")
+                    logger.warning(
+                        f"WARNING: {task.description['name']} results already exists. Skipping.")
                     del self.tasks[0]
                     continue
 
             try:
                 task_eval_splits = (
-                    eval_splits if eval_splits is not None else task.description.get("eval_splits", [])
+                    eval_splits if eval_splits is not None else task.description.get(
+                        "eval_splits", [])
                 )
 
                 # load data
@@ -291,17 +306,44 @@ class MTEB:
                 # save results
                 if output_folder is not None:
                     with open(save_path, "w") as f_out:
-                        json.dump(task_results, f_out, indent=2, sort_keys=True)
+                        json.dump(task_results, f_out,
+                                  indent=2, sort_keys=True)
 
                 evaluation_results[task.description["name"]] = task_results
 
+                # Logging for determined and wandb
+
+                metrics = {task.description["name"]: task_results}
+                det_metrics = {}
+                for task, res_dict in metrics.items():
+                    for res_name, res_val in res_dict.items():
+                        det_metrics[task + "_" + res_name] = res_val
+                if results and core_context.distributed.rank == 0:
+                    core_context.train.report_validation_metrics(
+                        steps_completed=1, metrics=det_metrics)
+
+                    if os.environ.get("WANDB_API_KEY"):
+                        logging.info("Reporting results to wandb ... ")
+                        name = model_name + "_mteb"
+                        run = wandb.init(
+                            project="Embeddings",
+                            config=hparams,
+                            name=name,
+                            job_type="mteb_eval",
+                            tags=["eval"],
+                        )
+                        wandb.log(metrics)
+
             except Exception as e:
-                logger.error(f"Error while evaluating {task.description['name']}: {e}")
+                logger.error(
+                    f"Error while evaluating {task.description['name']}: {e}")
                 if raise_error:
                     raise e
-                logger.error(f"Please check all the error logs at: {self.err_logs_path}")
+                logger.error(
+                    f"Please check all the error logs at: {self.err_logs_path}")
                 with open(self.err_logs_path, "a") as f_out:
-                    f_out.write(f"{datetime.now()} >>> {task.description['name']}\n")
+                    f_out.write(
+                        f"{datetime.now()} >>> {task.description['name']}\n")
                     f_out.write(traceback.format_exc())
                     f_out.write("\n\n")
 
