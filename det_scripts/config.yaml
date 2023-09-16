@@ -19,7 +19,5 @@ hyperparameters:
   model_name: average_word_embeddings_komninos
   tasks:
     - Banking77Classification
-entrypoint: >-
-  python -m determined.launch.torch_distributed
-  python main.py
+entrypoint: python main.py
 max_restarts: 0

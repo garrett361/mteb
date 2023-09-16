@@ -11,8 +11,7 @@ from mteb import MTEB
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-MODEL_TYPE_DICT = {"INSTRUCTOR": INSTRUCTOR,
-                   "SentenceTransformer": SentenceTransformer}
+MODEL_TYPE_DICT = {"INSTRUCTOR": INSTRUCTOR, "SentenceTransformer": SentenceTransformer}
 
 
 def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
@@ -24,8 +23,7 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
     ), f"Expected model_type to be in {list(MODEL_TYPE_DICT)} received {model_type}"
 
     model = SentenceTransformer(model_name, device=device)
-    assert hasattr(
-        model, "start_multi_process_pool"), "No start_multi_process_pool attr"
+    assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr"
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
         task_types=hparams.get("task_types"),
