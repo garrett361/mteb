@@ -312,6 +312,9 @@ class MTEB:
                 evaluation_results[task.description["name"]] = task_results
 
                 # Logging for determined and wandb
+                core_context = kwargs.pop("core_context")
+                model_name = kwargs.pop("model_name")
+                hparams = kwargs.pop("hparams")
 
                 metrics = {task.description["name"]: task_results}
                 det_metrics = {}
