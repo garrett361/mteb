@@ -302,10 +302,13 @@ class MTEB:
                 hparams = kwargs.get("hparams")
 
                 metrics = {task.description["name"]: task_results}
+
+                # Need to do some filtering for det metrics.
                 det_metrics = {}
                 for task, res_dict in metrics.items():
                     for res_name, res_val in res_dict.items():
-                        det_metrics[task + "_" + res_name] = res_val
+                        if res_val is not None:
+                            det_metrics[task + "_" + res_name] = res_val
                 if results and core_context.distributed.rank == 0:
 
                     if os.environ.get("WANDB_API_KEY"):
