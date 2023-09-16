@@ -83,6 +83,9 @@ setup(
         "rich",
         "determined==0.25.1",
         "wandb==0.15.10",
+        "evaluate==0.4.0",
+        "InstructorEmbedding==1.0.1",
+        "pytorch-extension==0.2",
     ],
     extras_require=extras,
     classifiers=[

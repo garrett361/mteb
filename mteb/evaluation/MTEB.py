@@ -5,6 +5,7 @@ import pathlib
 import traceback
 from datetime import datetime
 from time import time
+from typing import List, Union
 
 import datasets
 from rich.console import Console
@@ -15,8 +16,6 @@ from ..abstasks import AbsTask
 from ..tasks import *
 
 logger = logging.getLogger(__name__)
-
-from typing import List, Union
 
 
 class MTEB:
@@ -105,7 +104,7 @@ class MTEB:
         # disable logging for other ranks
         if int(os.getenv("RANK", 0)) != 0:
             return
-            
+
         console = Console()
         if name:
             console.rule(f"[bold]{name}\n", style="grey15")
@@ -165,7 +164,9 @@ class MTEB:
                 tasks_known = set([x.description["name"] for x in self.tasks_cls])
                 tasks_unknown = set(x for x in self._tasks if isinstance(x, str)) - tasks_known
                 if tasks_unknown:
-                    unknown_str, known_str = ",".join(sorted(list(tasks_unknown))), ",".join(sorted(list(tasks_known)))
+                    unknown_str, known_str = ",".join(sorted(list(tasks_unknown))), ",".join(
+                        sorted(list(tasks_known))
+                    )
                     logger.warning(f"WARNING: Unknown tasks: {unknown_str}. Known tasks: {known_str}.")
             # add task if subclass of mteb.tasks
             self.tasks.extend([x for x in self._tasks if isinstance(x, AbsTask)])
@@ -173,7 +174,8 @@ class MTEB:
 
         # Otherwise use filters to select tasks
         filtered_tasks = filter(
-            lambda x: (self._task_types is None) or (x.description["type"] in self._task_types), self.tasks_cls
+            lambda x: (self._task_types is None) or (x.description["type"] in self._task_types),
+            self.tasks_cls,
         )
         filtered_tasks = filter(
             lambda x: (self._task_categories is None) or (x.description["category"] in self._task_categories),
@@ -184,7 +186,8 @@ class MTEB:
         )
         # keep only tasks with at least one language in the filter
         filtered_tasks = filter(
-            lambda x: (not (self._task_langs)) or (len(set(x.description["eval_langs"]) & set(self._task_langs)) > 0),
+            lambda x: (not (self._task_langs))
+            or (len(set(x.description["eval_langs"]) & set(self._task_langs)) > 0),
             filtered_tasks,
         )
 
@@ -243,7 +246,9 @@ class MTEB:
         evaluation_results = {}
         while len(self.tasks) > 0:
             task = self.tasks[0]
-            logger.info(f"\n\n********************** Evaluating {task.description['name']} **********************")
+            logger.info(
+                f"\n\n********************** Evaluating {task.description['name']} **********************"
+            )
 
             # skip evaluation if results folder exists and overwrite_results is False
             if output_folder is not None:
@@ -254,7 +259,9 @@ class MTEB:
                     continue
 
             try:
-                task_eval_splits = eval_splits if eval_splits is not None else task.description.get("eval_splits", [])
+                task_eval_splits = (
+                    eval_splits if eval_splits is not None else task.description.get("eval_splits", [])
+                )
 
                 # load data
                 logger.info(f"Loading dataset for {task.description['name']}")
@@ -267,10 +274,15 @@ class MTEB:
                     "mteb_dataset_name": task.description["name"],
                 }
                 for split in task_eval_splits:
+                    assert hasattr(
+                        model, "start_multi_process_pool"
+                    ), "No start_multi_process_pool attr before evaluate"
                     tick = time()
                     results = task.evaluate(model, split, **kwargs)
                     tock = time()
-                    logger.info(f"Evaluation for {task.description['name']} on {split} took {tock - tick:.2f} seconds")
+                    logger.info(
+                        f"Evaluation for {task.description['name']} on {split} took {tock - tick:.2f} seconds"
+                    )
                     results["evaluation_time"] = round(tock - tick, 2)
                     task_results[split] = results
                     if verbosity >= 1:

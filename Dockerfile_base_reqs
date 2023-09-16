@@ -3,5 +3,5 @@ WORKDIR /
 COPY . mteb/
 WORKDIR mteb/
 RUN pip install -e ".[beir]"
-
+WORKDIR /
 

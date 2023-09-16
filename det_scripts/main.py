@@ -5,18 +5,26 @@ from typing import Any, Dict
 import determined as det
 import torch
 import wandb
+from InstructorEmbedding import INSTRUCTOR
 from sentence_transformers import SentenceTransformer
 
 from mteb import MTEB
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+MODEL_TYPE_DICT = {"INSTRUCTOR": INSTRUCTOR, "SentenceTransformer": SentenceTransformer}
+
 
 def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
     # Define the sentence-transformers model name
     model_name = hparams["model_name"]
+    model_type = hparams["model_type"]
+    assert (
+        model_type in MODEL_TYPE_DICT
+    ), f"Expected model_type to be in {list(MODEL_TYPE_DICT)} received {model_type}"
 
     model = SentenceTransformer(model_name, device=device)
+    assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr"
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
         task_types=hparams.get("task_types"),
@@ -52,6 +60,9 @@ if __name__ == "__main__":
     info = det.get_cluster_info()
     assert info, "This script must run on a determined cluster."
     hparams = info.trial.hparams
-    distributed = det.core.DistributedContext.from_torch_distributed()
+    try:
+        distributed = det.core.DistributedContext.from_torch_distributed()
+    except KeyError:
+        distributed = None
     with det.core.init(distributed=distributed) as core_context:
         main(hparams, core_context)
