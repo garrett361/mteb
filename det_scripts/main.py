@@ -22,7 +22,7 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
         model_type in MODEL_TYPE_DICT
     ), f"Expected model_type to be in {list(MODEL_TYPE_DICT)} received {model_type}"
 
-    model = SentenceTransformer(model_name, device=device)
+    model = MODEL_TYPE_DICT[model_type](model_name, device=device)
     assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr"
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
@@ -36,6 +36,7 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
         core_context=core_context,
         model_name=model_name,
         hparams=hparams,
+        **hparams.get("evaluate_kwargs", {}),
     )
     logging.info(f"Results: {results}")
 

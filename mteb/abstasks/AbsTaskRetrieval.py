@@ -37,7 +37,7 @@ class AbsTaskRetrieval(AbsTask):
         self, model, split="test", batch_size=128, corpus_chunk_size=None, score_function="cos_sim", **kwargs
     ):
         logging.info(80 * "*")
-        logging.info("In evaluate")
+        logging.info(f"In evaluate, using batch_size {batch_size}")
         logging.info(80 * "*")
         try:
             from beir.retrieval.evaluation import EvaluateRetrieval
@@ -55,9 +55,6 @@ class AbsTaskRetrieval(AbsTask):
 
         # assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr after first DRES"
         if os.getenv("RANK", None) is None:
-            logging.info(80 * "*")
-            logging.info("In RANK block")
-            logging.info(80 * "*")
             # Non-distributed
             from beir.retrieval.search.dense import DenseRetrievalExactSearch as DRES
 
@@ -88,13 +85,11 @@ class AbsTaskRetrieval(AbsTask):
             )
             # assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr after DRPES"
 
-        retriever = EvaluateRetrieval(
-            model, score_function=score_function)  # or "cos_sim" or "dot"
+        retriever = EvaluateRetrieval(model, score_function=score_function)  # or "cos_sim" or "dot"
         start_time = time()
         results = retriever.retrieve(corpus, queries)
         end_time = time()
-        logger.info("Time taken to retrieve: {:.2f} seconds".format(
-            end_time - start_time))
+        logger.info("Time taken to retrieve: {:.2f} seconds".format(end_time - start_time))
 
         ndcg, _map, recall, precision = retriever.evaluate(
             relevant_docs,
@@ -102,8 +97,7 @@ class AbsTaskRetrieval(AbsTask):
             retriever.k_values,
             ignore_identical_ids=kwargs.get("ignore_identical_ids", True),
         )
-        mrr = retriever.evaluate_custom(
-            relevant_docs, results, retriever.k_values, "mrr")
+        mrr = retriever.evaluate_custom(relevant_docs, results, retriever.k_values, "mrr")
 
         scores = {
             **{f"ndcg_at_{k.split('@')[1]}": v for (k, v) in ndcg.items()},
@@ -130,8 +124,7 @@ class DRESModel:
     def encode_queries(self, queries: List[str], batch_size: int, **kwargs):
         if self.use_sbert_model:
             if isinstance(self.model._first_module(), Transformer):
-                logger.info(
-                    f"Queries will be truncated to {self.model.get_max_seq_length()} tokens.")
+                logger.info(f"Queries will be truncated to {self.model.get_max_seq_length()} tokens.")
             elif isinstance(self.model._first_module(), WordEmbeddings):
                 logger.warning(
                     "Queries will not be truncated. This could lead to memory issues. In that case please lower the batch_size."
@@ -148,8 +141,7 @@ class DRESModel:
             ]
         else:
             sentences = [
-                (doc["title"] + self.sep + doc["text"]
-                 ).strip() if "title" in doc else doc["text"].strip()
+                (doc["title"] + self.sep + doc["text"]).strip() if "title" in doc else doc["text"].strip()
                 for doc in corpus
             ]
         return self.model.encode(sentences, batch_size=batch_size, **kwargs)
