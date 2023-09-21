@@ -245,6 +245,24 @@ class MTEB:
         logger.info(f"\n\n## Evaluating {len(self.tasks)} tasks:")
         self.print_selected_tasks()
         evaluation_results = {}
+
+        # Logging for determined and wandb
+        core_context = kwargs["core_context"]
+        model_name = kwargs["model_name"]
+        hparams = kwargs["hparams"]
+
+        if os.environ.get("WANDB_API_KEY") and core_context.distributed.rank == 0:
+            logging.info("Reporting results to wandb ... ")
+            assert isinstance(model_name, str)
+            name = model_name + "_mteb"
+            run = wandb.init(
+                project="Embeddings",
+                config=hparams,
+                name=name,
+                job_type="mteb_eval",
+                tags=["eval"],
+            )
+
         while len(self.tasks) > 0:
             task = self.tasks[0]
             logger.info(
@@ -296,11 +314,6 @@ class MTEB:
 
                 evaluation_results[task.description["name"]] = task_results
 
-                # Logging for determined and wandb
-                core_context = kwargs.get("core_context")
-                model_name = kwargs.get("model_name")
-                hparams = kwargs.get("hparams")
-
                 metrics = {task.description["name"]: task_results}
 
                 # Need to do some filtering for det metrics.
@@ -312,15 +325,6 @@ class MTEB:
                 if results and core_context.distributed.rank == 0:
 
                     if os.environ.get("WANDB_API_KEY"):
-                        logging.info("Reporting results to wandb ... ")
-                        name = model_name + "_mteb"
-                        run = wandb.init(
-                            project="Embeddings",
-                            config=hparams,
-                            name=name,
-                            job_type="mteb_eval",
-                            tags=["eval"],
-                        )
                         wandb.log(metrics)
                     core_context.train.report_validation_metrics(steps_completed=1, metrics=det_metrics)
 
