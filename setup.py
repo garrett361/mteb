@@ -45,7 +45,7 @@ with open("README.md", mode="r", encoding="utf-8") as readme_file:
 
 
 extras = {}
-extras["beir"] = ["beir"]
+extras["beir"] = ["beir==2.0.0"]
 
 
 setup(
