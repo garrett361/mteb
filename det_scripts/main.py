@@ -29,6 +29,7 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
         task_types=hparams.get("task_types"),
         task_categories=hparams.get("task_categories"),
         task_langs=hparams.get("task_langs"),
+        hparams=hparams,
     )
     results = evaluation.run(
         model,

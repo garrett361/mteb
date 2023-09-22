@@ -151,6 +151,7 @@ class MTEB:
         """
         # Get all existing tasks
         tasks_categories_cls = [cls for cls in AbsTask.__subclasses__()]
+        # GG_NOTE: Classes are initialized here!
         self.tasks_cls = [
             cls(langs=self._task_langs, **kwargs)
             for cat_cls in tasks_categories_cls
@@ -296,7 +297,7 @@ class MTEB:
                     assert hasattr(
                         model, "start_multi_process_pool"
                     ), "No start_multi_process_pool attr before evaluate"
-                    tick = time()
+                    tick = time
                     results = task.evaluate(model, split, **kwargs)
                     tock = time()
                     logger.info(
