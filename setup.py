@@ -86,6 +86,7 @@ setup(
         "evaluate==0.4.0",
         "InstructorEmbedding==1.0.1",
         "pytorch-extension==0.2",
+        "omegaconf==2.3.0",
     ],
     extras_require=extras,
     classifiers=[
