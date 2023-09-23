@@ -297,7 +297,7 @@ class MTEB:
                     assert hasattr(
                         model, "start_multi_process_pool"
                     ), "No start_multi_process_pool attr before evaluate"
-                    tick = time
+                    tick = time()
                     results = task.evaluate(model, split, **kwargs)
                     tock = time()
                     logger.info(
