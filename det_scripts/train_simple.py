@@ -1,767 +1,282 @@
-# This script is based on the modification from https://github.com/huggingface/transformers
-import json
 import logging
 import os
-import random
-import sys
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from collections import defaultdict
+from typing import List
 
 import datasets
 import determined as det
+import numpy as np
 import omegaconf
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import transformers
-from datasets import Dataset, DatasetDict
-from filelock import FileLock
-from InstructorEmbedding import INSTRUCTOR
-from torch.utils.data import SequentialSampler
-from torch.utils.data.distributed import DistributedSampler
-from transformers import (
-    AutoTokenizer,
-    DataCollatorForSeq2Seq,
-    HfArgumentParser,
-    MBart50Tokenizer,
-    MBart50TokenizerFast,
-    MBartTokenizer,
-    MBartTokenizerFast,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
-    set_seed,
-)
-from transformers.integrations import WandbCallback
-from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, is_offline_mode
-from transformers.utils.versions import require_version
+import wandb
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-check_min_version("4.20.0.dev0")
-
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
+RANK = int(os.getenv("RANK", 0))
 
 
-def has_length(dataset):
+class TESTModel(nn.Module):
     """
-    Checks if the dataset implements __len__() and it doesn't raise an error
+    Trivial test model.
     """
-    try:
-        return len(dataset) is not None
-    except TypeError:
-        # TypeError: len() of unsized object
-        return False
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        if not hasattr(self, "device"):
+            self.device = "cuda"
+
+    def forward(self, *args, **kwargs):
+        return torch.randn(kwargs["input_ids"].shape[0], 128, device=self.device)
+
+    def encode(self, sentences, batch_size: int = 32, **kwargs) -> List[torch.Tensor]:
+        return torch.randn(len(sentences), 128, device=self.device)
 
 
-class InstructorTrainer(Seq2SeqTrainer):
-    def _get_train_sampler(self):
-        if self.train_dataset is None or not has_length(self.train_dataset):
-            return None
+def build_model_and_optimizer(hparams: omegaconf.OmegaConf):
+    model = transformers.AutoModel.from_pretrained(hparams.model_name)
+    if WORLD_SIZE > 1:
+        model = DDP(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=hparams.lr)
+    return model, optimizer
 
-        generator = None
-        if self.args.world_size <= 1:
-            generator = torch.Generator()
-            # for backwards compatibility, we generate a seed here (which is sampled from a generator seeded with
-            # `args.seed`) if data_seed isn't provided.
-            # Further on in this method, we default to `args.seed` instead.
-            if self.args.data_seed is None:
-                seed = int(torch.empty((), dtype=torch.int64).random_().item())
-            else:
-                seed = self.args.data_seed
-            generator.manual_seed(seed)
 
-        seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+def build_train_val_dataset_dicts(hparams: omegaconf.OmegaConf):
+    train_dataset_dict = datasets.load_dataset(hparams.train_dataset)
+    val_dataset_dict = datasets.load_dataset(hparams.val_dataset)
+    return train_dataset_dict, val_dataset_dict
 
-        if self.args.world_size <= 1:
-            return SequentialSampler(self.train_dataset)
+
+def build_train_val_dataloaders_dict(
+    train_dataset_dict: datasets.DatasetDict,
+    val_dataset_dict: datasets.DatasetDict,
+    hparams: omegaconf.OmegaConf,
+):
+    tokenizer_name = hparams.get("tokenizer_name") or hparams.model_name
+    tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.paddding_side = "right"
+
+    def collator(examples):
+        keys = ("pos", "neg", "query")
+        examples_dict = defaultdict(list)
+        for example in examples:
+            for k in keys:
+                examples_dict[k].append(example[k])
+        inputs_dict = {
+            key: tokenizer(
+                examples_dict[key], return_tensors="pt", padding=True, return_attention_mask=True
+            )
+            for key in examples_dict
+        }
+        return inputs_dict
+
+    train_dataloader_dict = {}
+    val_dataloader_dict = {}
+    for task_name in train_dataset_dict:
+        train_dset = train_dataset_dict[task_name]
+        val_dset = val_dataset_dict[task_name]
+        if WORLD_SIZE == 1:
+            train_sampler = torch.utils.data.SequentialSampler(train_dset)
+            val_sampler = torch.utils.data.SequentialSampler(val_dset)
         else:
-            return DistributedSampler(
-                self.train_dataset,
-                num_replicas=self.args.world_size,
-                rank=self.args.process_index,
-                seed=seed,
-            )
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        for task_id in inputs["task_name"]:
-            assert task_id == inputs["task_name"][0], (
-                f"Examples in the same batch should come from the same task, "
-                f"but task {task_id} and task {inputs['task_name'][0]} are found"
-            )
-        cur_results = {}
-        for k in ["query", "pos", "neg"]:
-            cur_inputs = {
-                "input_ids": inputs[f"{k}_input_ids"],
-                "attention_mask": inputs[f"{k}_attention_mask"],
-                "context_masks": inputs[f"{k}_context_masks"],
-            }
-            cur_results[k] = model(cur_inputs)["sentence_embedding"]
-        embeddings_query = cur_results["query"]
-        embeddings_pos = cur_results["pos"]
-        embeddings_neg = cur_results["neg"]
-
-        num = len(embeddings_query)
-        all_scores = None
-        from torch import nn
-
-        similarity_fct = nn.CosineSimilarity(dim=-1)
-        for i in range(0, num):
-            # GG_NOTE: compute the cos between the anchor and the positive result.
-            anchor_emb = embeddings_query[i].unsqueeze(0)
-            pos_emb = embeddings_pos[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
-
-            # GG_NOTE: compute the cos between the anchor and all negative results.
-            for j in range(0, num):
-                one_neg_emb = embeddings_neg[j].unsqueeze(0)
-                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_scores is None:
-                all_scores = cur_score.unsqueeze(0)
-            else:
-                all_scores = torch.cat([all_scores, cur_score.unsqueeze(0)], dim=0)
-
-        labels = torch.zeros(all_scores.size(0)).long().to(embeddings_query.device)
-        loss = nn.CrossEntropyLoss()(all_scores, labels)
-
-        all_another_scores = None
-        for i in range(0, num):
-            anchor_emb = embeddings_pos[i].unsqueeze(0)
-            pos_emb = embeddings_query[i].unsqueeze(0)
-            cur_score = similarity_fct(anchor_emb, pos_emb) / self.args.cl_temperature
-            # GG_NOTE: This is just doubling the off-diagonal losses? Think it's the symmetric loss
-            # thing.
-
-            for j in range(0, num):
-                if i == j:
-                    continue
-                one_neg_emb = embeddings_query[j].unsqueeze(0)
-                one_neg_score = similarity_fct(anchor_emb, one_neg_emb) / self.args.cl_temperature
-                cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-            if all_another_scores is None:
-                all_another_scores = cur_score.unsqueeze(0)
-            else:
-                all_another_scores = torch.cat([all_another_scores, cur_score.unsqueeze(0)], dim=0)
-        labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeddings_query.device)
-        loss += nn.CrossEntropyLoss()(all_another_scores, labels_another)
-
-        if return_outputs:
-            return loss, all_scores
-        return loss
-
-
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
-    """
-
-    model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=os.environ["HF_HOME"],
-        metadata={"help": "Where to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
-        },
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-                "with private models)."
-            )
-        },
-    )
-    resize_position_embeddings: Optional[bool] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Whether to automatically resize the position embeddings if `max_source_length` exceeds "
-                "the model's position embeddings."
-            )
-        },
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    lang: str = field(default=None, metadata={"help": "Language id for summarization."})
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    processed_data_dir: Optional[str] = field(
-        default=None, metadata={"help": "directory to the processed data"}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "The configuration name of the dataset to use (via the datasets library)."},
-    )
-    sample_selection_train_file_path: Optional[str] = field(
-        default=None, metadata={"help": "sample_selection_train_file_path"}
-    )
-    text_column: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The name of the column in the datasets containing the full texts (for summarization)."
-        },
-    )
-    summary_column: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The name of the column in the datasets containing the summaries (for summarization)."
-        },
-    )
-    train_file: Optional[str] = field(
-        default=None, metadata={"help": "The input training data file (a jsonlines or csv file)."}
-    )
-    validation_file: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "An optional input evaluation data file to evaluate the metrics (rouge) on (a jsonlines or csv file)."
-            )
-        },
-    )
-    test_file: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "An optional input test data file to evaluate the metrics (rouge) on (a jsonlines or csv file)."
-        },
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    def_only: bool = field(default=False, metadata={"help": "def_only"})
-    add_prompt_to_document: bool = field(default=True, metadata={"help": "add_prompt_to_document"})
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    debug_mode: Optional[int] = field(
-        default=None,
-        metadata={"help": "debug mode"},
-    )
-    max_examples: Optional[int] = field(
-        default=None,
-        metadata={"help": "debug mode"},
-    )
-    cl_temperature: Optional[float] = field(
-        default=None,
-        metadata={"help": "temperature"},
-    )
-    max_source_length: Optional[int] = field(
-        default=512,
-        metadata={
-            "help": (
-                "The maximum total input sequence length after tokenization. Sequences longer "
-                "than this will be truncated, sequences shorter will be padded."
-            )
-        },
-    )
-    sub_sample_ratio: Optional[float] = field(
-        default=2.0,
-        metadata={"help": ("sub_sample_ratio")},
-    )
-    val_max_target_length: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The maximum total sequence length for validation target text after tokenization. Sequences longer "
-                "than this will be truncated, sequences shorter will be padded. Will default to `max_target_length`."
-                "This argument is also used to override the ``max_length`` param of ``model.generate``, which is used "
-                "during ``evaluate`` and ``predict``."
-            )
-        },
-    )
-    pad_to_max_length: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to pad all samples to model maximum sentence length. "
-                "If False, will pad the samples dynamically when batching to the maximum length in the batch. More "
-                "efficient on GPU but very bad for TPU."
-            )
-        },
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-                "value if set."
-            )
-        },
-    )
-    max_predict_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of prediction examples to this "
-                "value if set."
-            )
-        },
-    )
-    num_beams: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Number of beams to use for evaluation. This argument will be passed to ``model.generate``, "
-                "which is used during ``evaluate`` and ``predict``."
-            )
-        },
-    )
-    ignore_pad_token_for_loss: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to ignore the tokens corresponding to padded labels in the loss computation or not."
-        },
-    )
-    source_prefix: Optional[str] = field(
-        default="", metadata={"help": "A prefix to add before every source text (useful for T5 models)."}
-    )
-
-    forced_bos_token: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The token to force as the first generated token after the decoder_start_token_id."
-                "Useful for multilingual models like mBART where the first generated token"
-                "needs to be the target language token (Usually it is the target language token)"
-            )
-        },
-    )
-
-    def __post_init__(self):
-        pass
-
-
-summarization_name_mapping = {
-    "amazon_reviews_multi": ("review_body", "review_title"),
-    "big_patent": ("description", "abstract"),
-    "cnn_dailymail": ("article", "highlights"),
-    "orange_sum": ("text", "summary"),
-    "pn_summary": ("article", "summary"),
-    "psc": ("extract_text", "summary_text"),
-    "samsum": ("dialogue", "summary"),
-    "thaisum": ("body", "summary"),
-    "xglue": ("news_body", "news_title"),
-    "xsum": ("document", "summary"),
-    "wiki_summary": ("article", "highlights"),
-}
-
-
-def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        hparams, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
-    else:
-        hparams, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    data_args.output_dir = training_args.output_dir
-    real_name_or_path = hparams.model_name_or_path
-    data_args.model_name_or_path = hparams.model_name_or_path
-    data_args.tokenizer_name_or_path = hparams.model_name_or_path
-    training_args.cl_temperature = data_args.cl_temperature
-    training_args.remove_unused_columns = False
-    if not os.path.isdir(data_args.output_dir):
-        os.makedirs(data_args.output_dir, exist_ok=True)
-
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    log_level = logging.ERROR
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    last_checkpoint = None
-    if (
-        os.path.isdir(training_args.output_dir)
-        and training_args.do_train
-        and not training_args.overwrite_output_dir
-    ):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
-
-    # Set seed before initializing model.
-    tokenizer = AutoTokenizer.from_pretrained(
-        hparams.tokenizer_name if hparams.tokenizer_name else hparams.model_name_or_path,
-        cache_dir=hparams.cache_dir,
-        use_fast=hparams.use_fast_tokenizer,
-        revision=hparams.model_revision,
-        use_auth_token=True if hparams.use_auth_token else None,
-    )
-
-    set_seed(training_args.seed)
-    with open(os.path.join(hparams.cache_dir, "medi-data/medi-data.json")) as f:
-        train_examples_raw = json.load(f)
-
-    if data_args.debug_mode:
-        train_examples_raw = train_examples_raw[: data_args.debug_mode]
-    old_train_examples_raw = train_examples_raw
-    total_train_n = len(old_train_examples_raw)
-
-    real_batch_size = max(
-        training_args.per_device_train_batch_size,
-        training_args.per_device_train_batch_size * torch.cuda.device_count(),
-    )
-
-    # print('real_batch_size: ', real_batch_size,training_args.per_device_train_batch_size,torch.cuda.device_count())
-    def get_examples_raw(old_examples_raw, total_n, real_batch_size):
-        examples_raw = []
-        for idx in range(0, total_n, real_batch_size):
-            local_task_name = old_examples_raw[idx]["task_name"]
-            cur_batch = []
-            include_batch = True
-            for idx1 in range(idx, min(idx + real_batch_size, total_n)):
-                if not old_examples_raw[idx1]["task_name"] == local_task_name:
-                    print(f'one batch in task {old_examples_raw[idx1]["task_name"]} is skipped')
-                    include_batch = False
-                    break
-                else:
-                    cur_batch.append(old_examples_raw[idx1])
-            if include_batch and len(cur_batch) == real_batch_size:
-                examples_raw.append(cur_batch)
-        return examples_raw
-
-    train_examples_raw = get_examples_raw(old_train_examples_raw, total_train_n, real_batch_size)
-    random.shuffle(train_examples_raw)
-
-    if (
-        data_args.max_examples is not None
-        and len(train_examples_raw * real_batch_size) > data_args.max_examples
-    ):
-        train_examples_raw = train_examples_raw[: int(data_args.max_examples / real_batch_size)]
-
-    train_examples_raw_batch = train_examples_raw
-    train_examples_raw = []
-
-    for b in train_examples_raw_batch:
-        train_examples_raw += b
-    print(f"There are {len(train_examples_raw)} pairs to train in total.")
-
-    if data_args.debug_mode:
-        train_examples_raw = train_examples_raw[: int(data_args.debug_mode)]
-
-    def get_dataset(examples_raw):
-        examples = {"query": [], "pos": [], "neg": [], "task_name": []}
-        task_name_map = {}
-        total_num = len(examples_raw)
-        task_count = 0
-        for i in range(total_num):
-            cur_e = examples_raw[i]
-            for k in ["query", "pos", "neg"]:
-                for s in cur_e[k][:-1]:
-                    assert not "!@#$%^&**!@#$%^&**" in s
-                cur_e[k][-1] = str(cur_e[k][-1])
-                if not data_args.add_prompt_to_document:
-                    cur_e[k][0] = ""
-                assert cur_e[k][0].startswith("Represent ") or cur_e[k][0] == ""
-                examples[k].append("!@#$%^&**!@#$%^&**".join(cur_e[k]))
-            if not cur_e["task_name"] in task_name_map:
-                task_name_map[cur_e["task_name"]] = task_count
-                task_count += 1
-            examples["task_name"].append(task_name_map[cur_e["task_name"]])
-        return examples
-
-    train_raw_datasets = DatasetDict({"train": Dataset.from_dict(get_dataset(train_examples_raw))})
-
-    model = INSTRUCTOR(real_name_or_path, cache_folder=hparams.cache_dir)
-    column_names = train_raw_datasets["train"].column_names
-
-    def preprocess_function(examples):
-        all_tokenized = None
-        for key in ["query", "pos", "neg"]:
-            num = len(examples[key])
-            contexts = []
-            concatenated_input_texts = []
-            for local_idx in range(num):
-                splits = examples[key][local_idx].split("!@#$%^&**!@#$%^&**")
-                assert len(splits) == 2
-                contexts.append(splits[0])
-                concatenated_input_texts.append("".join(splits))
-                assert isinstance(contexts[-1], str)
-                assert isinstance(concatenated_input_texts[-1], str)
-            tokenized = tokenizer(
-                concatenated_input_texts,
-                padding="max_length",
-                truncation="longest_first",
-                return_tensors="pt",
-                max_length=data_args.max_source_length,
-            )
-            context_tok = tokenizer(
-                contexts,
-                padding="max_length",
-                truncation="longest_first",
-                return_tensors="pt",
-                max_length=data_args.max_source_length,
-            )
-            tokenized["context_masks"] = torch.sum(context_tok["attention_mask"], dim=1)
-            tokenized["context_masks"] = tokenized["context_masks"] - 1
-            for my_idx in range(len(tokenized["context_masks"])):
-                if tokenized["context_masks"][my_idx] <= 1:
-                    tokenized["context_masks"][my_idx] = 0
-            keys = tokenized.keys()
-            if all_tokenized is None:
-                all_tokenized = tokenized.copy()
-                for k in keys:
-                    all_tokenized[k] = all_tokenized[k].tolist()
-            for k in keys:
-                all_tokenized[f"{key}_{k}"] = tokenized[k].tolist()
-        all_tokenized["task_name"] = examples["task_name"]
-        return all_tokenized
-
-    train_dataset = train_raw_datasets["train"]
-    val_dataset = None
-    if data_args.validation_file:
-        with open(data_args.validation_file) as f:
-            val_examples_raw = json.load(f)
-
-        old_val_examples_raw = val_examples_raw
-        total_val_n = len(old_val_examples_raw)
-
-        val_examples_raw = get_examples_raw(old_val_examples_raw, total_val_n, real_batch_size)
-        random.shuffle(val_examples_raw)
-
-        val_examples_raw_batch = val_examples_raw
-        val_examples_raw = []
-        for b in val_examples_raw_batch:
-            val_examples_raw += b
-        print(f"There are {len(val_examples_raw)} pairs in val dataset.")
-        val_raw_datasets = DatasetDict({"val": Dataset.from_dict(get_dataset(val_examples_raw))})
-        val_dataset = val_raw_datasets["val"]
-
-        with training_args.main_process_first(desc="validation dataset map pre-processing"):
-            val_dataset = val_dataset.map(
-                preprocess_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on val dataset",
-            )
-
-    if data_args.max_train_samples is not None:
-        max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-        train_dataset = train_dataset.select(range(max_train_samples))
-    with training_args.main_process_first(desc="train dataset map pre-processing"):
-        train_dataset = train_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc="Running tokenizer on train dataset",
+            train_sampler = torch.utils.data.DistributedSampler(train_dset)
+            val_sampler = torch.utils.data.DistributedSampler(val_dset)
+        train_dataloader_dict[task_name] = torch.utils.data.DataLoader(
+            train_dset,
+            batch_size=hparams.batch_size,
+            collate_fn=collator,
+            sampler=train_sampler,
+            drop_last=True,
         )
-
-    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model=model,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-    )
-
-    trainer = InstructorTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=None,
-    )
-    # if os.environ.get("WANDB_API_KEY"):
-    #     wandb_callback = WandbCallback()
-    #     trainer.add_callback(wandb_callback)
-
-    checkpoint = None
-    if training_args.resume_from_checkpoint is not None:
-        checkpoint = training_args.resume_from_checkpoint
-    elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
-    trainer.train(resume_from_checkpoint=checkpoint)
-    trainer.model.save(training_args.output_dir)
+        val_dataloader_dict[task_name] = torch.utils.data.DataLoader(
+            val_dset,
+            batch_size=hparams.batch_size,
+            collate_fn=collator,
+            sampler=val_sampler,
+            drop_last=True,
+        )
+    return train_dataloader_dict, val_dataloader_dict
 
 
-def _mp_fn(index):
-    main()
+def get_next_inputs():
+    pass
 
 
-def main2(hparams: omegaconf.Omegaconf, core_context: det.core.Context):
-    # Set seed before initializing model.
-    tokenizer = AutoTokenizer.from_pretrained(
-        hparams.tokenizer_name if hparams.tokenizer_name else hparams.model_name,
-    )
+def save_model():
+    pass
 
-    set_seed(hparams.seed)
-    with open(os.path.join(hparams.cache_dir, "medi-data/medi-data.json")) as f:
-        train_examples_raw = json.load(f)
 
-    old_train_examples_raw = train_examples_raw
-    total_train_n = len(old_train_examples_raw)
+def get_loss(model, inputs, hparams):
+    embeds = {}
+    for k in ["query", "pos", "neg"]:
+        raw_model_outputs = model(**inputs[k])
+        if hparams.embed_strat == "last":
+            # Need to take the final state according to the attention masks
+            attn_mask_sum = inputs[k]["attention_mask"].sum(dim=-1) - 1
+            embeds[k] = raw_model_outputs.last_hidden_state[
+                range(raw_model_outputs.last_hidden_state.shape[0]), attn_mask_sum
+            ]
+        elif hparams.embed_strat == "weighted":
+            _, seq_len, _ = raw_model_outputs.last_hidden_state.shape
+            # Create the weights
+            linear_weigths = torch.arange(
+                start=1,
+                end=seq_len + 1,
+                dtype=raw_model_outputs.last_hidden_state.dtype,
+                device=raw_model_outputs.last_hidden_state.device,
+            ).flip(dims=(0,))[None, ..., None]
+            # Each weight needs to be weights by different values
+            weights /= weights.sum(dim=1)
+            logging.info("Using weights {weights}")
+            embeds[k] = raw_model_outputs.last_hidden_state * weights
+        else:
+            raise ValueError(f"Recieved unexpected embed_strat: {hparams.embed_strat}")
 
-    real_batch_size = max(
-        training_args.per_device_train_batch_size,
-        training_args.per_device_train_batch_size * torch.cuda.device_count(),
-    )
+    batch_size, _ = embeds["query"].shape
 
-    # print('real_batch_size: ', real_batch_size,training_args.per_device_train_batch_size,torch.cuda.device_count())
-    def get_examples_raw(old_examples_raw, total_n, real_batch_size):
-        examples_raw = []
-        for idx in range(0, total_n, real_batch_size):
-            local_task_name = old_examples_raw[idx]["task_name"]
-            cur_batch = []
-            include_batch = True
-            for idx1 in range(idx, min(idx + real_batch_size, total_n)):
-                if not old_examples_raw[idx1]["task_name"] == local_task_name:
-                    print(f'one batch in task {old_examples_raw[idx1]["task_name"]} is skipped')
-                    include_batch = False
-                    break
-                else:
-                    cur_batch.append(old_examples_raw[idx1])
-            if include_batch and len(cur_batch) == real_batch_size:
-                examples_raw.append(cur_batch)
-        return examples_raw
+    all_scores = None
 
-    train_examples_raw = get_examples_raw(old_train_examples_raw, total_train_n, real_batch_size)
-    random.shuffle(train_examples_raw)
-
-    if (
-        data_args.max_examples is not None
-        and len(train_examples_raw * real_batch_size) > data_args.max_examples
-    ):
-        train_examples_raw = train_examples_raw[: int(data_args.max_examples / real_batch_size)]
-
-    train_examples_raw_batch = train_examples_raw
-    train_examples_raw = []
-
-    for b in train_examples_raw_batch:
-        train_examples_raw += b
-    print(f"There are {len(train_examples_raw)} pairs to train in total.")
-
-    if data_args.debug_mode:
-        train_examples_raw = train_examples_raw[: int(data_args.debug_mode)]
-
-    def get_dataset(examples_raw):
-        examples = {"query": [], "pos": [], "neg": [], "task_name": []}
-        task_name_map = {}
-        total_num = len(examples_raw)
-        task_count = 0
-        for i in range(total_num):
-            cur_e = examples_raw[i]
-            for k in ["query", "pos", "neg"]:
-                for s in cur_e[k][:-1]:
-                    assert "!@#$%^&**!@#$%^&**" not in s
-                cur_e[k][-1] = str(cur_e[k][-1])
-                if not data_args.add_prompt_to_document:
-                    cur_e[k][0] = ""
-                assert cur_e[k][0].startswith("Represent ") or cur_e[k][0] == ""
-                examples[k].append("!@#$%^&**!@#$%^&**".join(cur_e[k]))
-            if cur_e["task_name"] not in task_name_map:
-                task_name_map[cur_e["task_name"]] = task_count
-                task_count += 1
-            examples["task_name"].append(task_name_map[cur_e["task_name"]])
-        return examples
-
-    train_raw_datasets = DatasetDict({"train": Dataset.from_dict(get_dataset(train_examples_raw))})
-
-    model = INSTRUCTOR(hparams.model_name)
-    column_names = train_raw_datasets["train"].column_names
-
-    def preprocess_function(examples):
-        all_tokenized = None
-        for key in ["query", "pos", "neg"]:
-            num = len(examples[key])
-            contexts = []
-            concatenated_input_texts = []
-            for local_idx in range(num):
-                splits = examples[key][local_idx].split("!@#$%^&**!@#$%^&**")
-                assert len(splits) == 2
-                contexts.append(splits[0])
-                concatenated_input_texts.append("".join(splits))
-                assert isinstance(contexts[-1], str)
-                assert isinstance(concatenated_input_texts[-1], str)
-            tokenized = tokenizer(
-                concatenated_input_texts,
-                padding="max_length",
-                truncation="longest_first",
-                return_tensors="pt",
-                max_length=data_args.max_source_length,
+    # GG_NOTE: Compute the cos-based loss over the scores between the query and its corresponding
+    # positive entry, competing against the score from the query against all negative entries
+    # in the batch.
+    similarity_fct = nn.CosineSimilarity(dim=-1)
+    for batch_idx in range(batch_size):
+        query_emb, pos_emb = embeds["query"][batch_idx], embeds["pos"][batch_idx]
+        # GG_NOTE: compute the cos between the query and the positive result.
+        # introduce a trivial batch dim and stack along the last dim.
+        cur_score = similarity_fct(query_emb[None], pos_emb[None])[None] / hparams.cl_temperature
+        # GG_NOTE: compute the cos between the query and all negative results and stack
+        # along last dimension
+        for neg_emb in embeds["neg"]:
+            one_neg_score = (
+                similarity_fct(query_emb[None], neg_emb[None])[None] / hparams.cl_temperature
             )
-            context_tok = tokenizer(
-                contexts,
-                padding="max_length",
-                truncation="longest_first",
-                return_tensors="pt",
-                max_length=data_args.max_source_length,
-            )
-            tokenized["context_masks"] = torch.sum(context_tok["attention_mask"], dim=1)
-            tokenized["context_masks"] = tokenized["context_masks"] - 1
-            for my_idx in range(len(tokenized["context_masks"])):
-                if tokenized["context_masks"][my_idx] <= 1:
-                    tokenized["context_masks"][my_idx] = 0
-            keys = tokenized.keys()
-            if all_tokenized is None:
-                all_tokenized = tokenized.copy()
-                for k in keys:
-                    all_tokenized[k] = all_tokenized[k].tolist()
-            for k in keys:
-                all_tokenized[f"{key}_{k}"] = tokenized[k].tolist()
-        all_tokenized["task_name"] = examples["task_name"]
-        return all_tokenized
+            cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
 
-    train_dataset = train_raw_datasets["train"]
+        # And also add all positive examples from other elements in the batch
+        for other_batch_idx in range(batch_size):
+            if other_batch_idx == batch_idx:
+                continue
+            other_pos_emb = embeds["pos"][other_batch_idx]
+            one_neg_score = (
+                similarity_fct(pos_emb[None], other_pos_emb[None])[None] / hparams.cl_temperature
+            )
+            cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
+
+        # And finally stack these results along the zeroth dim.
+        if all_scores is None:
+            all_scores = cur_score
+        else:
+            all_scores = torch.cat([all_scores, cur_score], dim=0)
+    labels = torch.zeros(all_scores.size(0)).long().to(embeds["query"].device)
+    loss = F.cross_entropy(all_scores, labels)
+
+    # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
+    # where they also compute losses for "document-to-question matching".
+    all_another_scores = None
+    for batch_idx in range(batch_size):
+        pos_emb, query_emb = embeds["pos"][batch_idx], embeds["query"][batch_idx]
+        cur_score = similarity_fct(pos_emb[None], query_emb[None])[None] / hparams.cl_temperature
+
+        for other_batch_idx in range(batch_size):
+            if other_batch_idx == batch_idx:
+                continue
+            other_query_emb = embeds["query"][other_batch_idx][None]
+            one_neg_score = similarity_fct(pos_emb, other_query_emb)[None] / hparams.cl_temperature
+            cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
+        if all_another_scores is None:
+            all_another_scores = cur_score
+        else:
+            all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
+    labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeds["query"].device)
+    loss += F.cross_entropy(all_another_scores, labels_another)
+
+    return loss
+
+
+def train_one_step():
+    pass
+
+
+def validate():
+    pass
+
+
+def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
+    transformers.set_seed(hparams.seed)
+    train_dataset_dict, val_dataset_dict = build_train_val_dataset_dicts(hparams)
+    train_dataloader_dict, val_dataloader_dict = build_train_val_dataloaders_dict(
+        train_dataset_dict, val_dataset_dict, hparams
+    )
+    small_loader = train_dataloader_dict["zeroshot"]
+
+    train_losses = []
+    step = 0
+
+    model, optimizer = build_model_and_optimizer(hparams)
+    model.to("cuda")
+    for _ in range(hparams.epochs):
+        model.train()
+        for inputs in small_loader:
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            loss = get_loss(model, inputs, hparams)
+            loss.backward()
+            train_losses.append(loss.item())
+            optimizer.step()
+            step += 1
+            optimizer.zero_grad(set_to_none=True)
+            if step % hparams.report_rate == 0:
+                mean_train_loss = np.array(train_losses).mean()
+                if RANK == 0:
+                    wandb.log({"step": step, "train_loss": mean_train_loss})
+                    core_context.train.report_training_metrics(
+                        steps_completed=step, metrics={"train_loss": mean_train_loss}
+                    )
+                train_losses = []
+
+        model.eval()
+        with torch.no_grad():
+            val_losses = []
+            for inputs in val_dataloader_dict["zeroshot"]:
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                loss = get_loss(model, inputs, hparams)
+                val_losses.append(loss.item())
+            mean_val_loss = np.array(val_losses).mean()
+            if RANK == 0:
+                wandb.log({"step": step, "val_loss": mean_val_loss})
+                core_context.train.report_validation_metrics(
+                    steps_completed=step, metrics={"val_loss": mean_val_loss}
+                )
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format=det.LOG_FORMAT)
     info = det.get_cluster_info()
     assert info, "This script must run on a determined cluster."
-    hparams = omegaconf.Omegaconf.create(info.trial.hparams)
+
+    hparams = omegaconf.OmegaConf.create(info.trial.hparams)
     try:
         distributed = det.core.DistributedContext.from_torch_distributed()
+        torch.distributed.init_process_group("nccl")
     except KeyError:
         distributed = None
     with det.core.init(distributed=distributed) as core_context:
-        main2(hparams, core_context)
+        if os.environ.get("WANDB_API_KEY") and core_context.distributed.rank == 0:
+            logging.info("Reporting results to wandb ... ")
+            assert isinstance(hparams.model_name, str)
+            name = hparams.model_name + "_medi_train"
+            run = wandb.init(
+                project="Embeddings",
+                config=dict(hparams),
+                name=name,
+                job_type="medi_train",
+                tags=["train"],
+            )
+
+        main(hparams, core_context)
