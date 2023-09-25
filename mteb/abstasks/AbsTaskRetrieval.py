@@ -140,8 +140,8 @@ class DRESModel:
                 logger.warning(
                     "Queries will not be truncated. This could lead to memory issues. In that case please lower the batch_size."
                 )
-        assert self.model_type in ("INSTRUCTOR", "SentenceTransformer")
-        if self.model_type == "SentenceTransformer":
+        assert self.model_type in ("INSTRUCTOR", "SentenceTransformer", "TESTModel")
+        if self.model_type in ("SentenceTransformer", "TESTModel"):
             return self.model.encode(queries, batch_size=batch_size, **kwargs)
         elif self.model_type == "INSTRUCTOR":
             new_sentences = []
@@ -156,7 +156,7 @@ class DRESModel:
             raise ValueError(f"Unexpected model type: {self.model_type}")
 
     def encode_corpus(self, corpus: List[Dict[str, str]], batch_size: int, **kwargs):
-        if self.model_type == "SentenceTransformer":
+        if self.model_type in ("SentenceTransformer", "TESTModel"):
             if type(corpus) is dict:
                 sentences = [
                     (corpus["title"][i] + self.sep + corpus["text"][i]).strip()

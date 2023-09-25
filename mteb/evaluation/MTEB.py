@@ -294,9 +294,9 @@ class MTEB:
                     "mteb_dataset_name": task.description["name"],
                 }
                 for split in task_eval_splits:
-                    assert hasattr(
-                        model, "start_multi_process_pool"
-                    ), "No start_multi_process_pool attr before evaluate"
+                    # assert hasattr(
+                    #     model, "start_multi_process_pool"
+                    # ), "No start_multi_process_pool attr before evaluate"
                     tick = time()
                     results = task.evaluate(model, split, **kwargs)
                     tock = time()
