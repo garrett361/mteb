@@ -1,9 +1,9 @@
 import logging
-import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import determined as det
 import torch
+import torch.nn as nn
 from InstructorEmbedding import INSTRUCTOR
 from sentence_transformers import SentenceTransformer
 
@@ -11,7 +11,28 @@ from mteb import MTEB
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-MODEL_TYPE_DICT = {"INSTRUCTOR": INSTRUCTOR, "SentenceTransformer": SentenceTransformer}
+
+class TESTModel(nn.Module):
+    """
+    Trivial test model implementing the minimal interface described in the README.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        if not hasattr(self, "device"):
+            self.device = "cuda"
+
+    def encode(self, sentences, batch_size: int = 32, **kwargs) -> List[torch.Tensor]:
+        return torch.randn(len(sentences), 128, device=self.device)
+
+
+MODEL_TYPE_DICT = {
+    "INSTRUCTOR": INSTRUCTOR,
+    "SentenceTransformer": SentenceTransformer,
+    "TESTModel": TESTModel,
+}
 
 
 def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
@@ -23,7 +44,6 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
     ), f"Expected model_type to be in {list(MODEL_TYPE_DICT)} received {model_type}"
 
     model = MODEL_TYPE_DICT[model_type](model_name, device=device)
-    assert hasattr(model, "start_multi_process_pool"), "No start_multi_process_pool attr"
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
         task_types=hparams.get("task_types"),
