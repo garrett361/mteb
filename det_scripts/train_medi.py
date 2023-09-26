@@ -1,7 +1,7 @@
 import logging
 import os
 from collections import defaultdict
-from typing import List
+from typing import Any, Dict, List
 
 import datasets
 import determined as det
@@ -16,6 +16,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 RANK = int(os.getenv("RANK", 0))
+WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
+USE_WANDB = WANDB_API_KEY is not None
 
 
 class TESTModel(nn.Module):
@@ -67,6 +69,9 @@ def build_train_val_dataloaders_dict(
         examples_dict = defaultdict(list)
         for example in examples:
             for k in keys:
+                # GG_NOTE: I would have thought that we should `join` the sentences in example[k]
+                # but in the INSTRUCTOR MTEB benchmarking code, they instead tokenize List[List[str]
+                # inputs.
                 examples_dict[k].append(example[k])
         inputs_dict = {
             key: tokenizer(
@@ -81,6 +86,7 @@ def build_train_val_dataloaders_dict(
     for task_name in train_dataset_dict:
         train_dset = train_dataset_dict[task_name]
         val_dset = val_dataset_dict[task_name]
+        # GG_TODO: Shuffling
         if WORLD_SIZE == 1:
             train_sampler = torch.utils.data.SequentialSampler(train_dset)
             val_sampler = torch.utils.data.SequentialSampler(val_dset)
@@ -104,15 +110,11 @@ def build_train_val_dataloaders_dict(
     return train_dataloader_dict, val_dataloader_dict
 
 
-def get_next_inputs():
-    pass
-
-
 def save_model():
     pass
 
 
-def get_loss(model, inputs, hparams):
+def process_batch(model, inputs, hparams) -> Dict[str, Any]:
     embeds = {}
     for k in ["query", "pos", "neg"]:
         raw_model_outputs = model(**inputs[k])
@@ -139,24 +141,35 @@ def get_loss(model, inputs, hparams):
             raise ValueError(f"Recieved unexpected embed_strat: {hparams.embed_strat}")
 
     batch_size, _ = embeds["query"].shape
+    device = embeds["query"].device
 
     all_scores = None
 
     # GG_NOTE: Compute the cos-based loss over the scores between the query and its corresponding
     # positive entry, competing against the score from the query against all negative entries
     # in the batch.
-    similarity_fct = nn.CosineSimilarity(dim=-1)
+    def dot(tensor1: torch.Tensor, tensor2: torch.Tensor) -> torch.Tensor:
+        """Dot products of 1D or 2D tensors with the same semantics as nn.CosineSimilarity."""
+        assert tensor1.shape == tensor2.shape
+        if tensor1.dim() == 1:
+            return tensor1 @ tensor2
+        if tensor1.dim() == 2:
+            assert tensor1.shape[0] == 1
+            return (tensor1 * tensor2).sum(dim=-1)
+        raise ValueError(f"Received unexpected {tensor1.dim()} dimensional tensor. Expected 1D/2D.")
+
+    similarity_fn_dict = {"cos": nn.CosineSimilarity(dim=-1), "dot": dot}
+
+    similarity_fn = similarity_fn_dict[hparams.similarity_fn]
     for batch_idx in range(batch_size):
         query_emb, pos_emb = embeds["query"][batch_idx], embeds["pos"][batch_idx]
         # GG_NOTE: compute the cos between the query and the positive result.
-        # introduce a trivial batch dim and stack along the last dim.
-        cur_score = similarity_fct(query_emb[None], pos_emb[None])[None] / hparams.cl_temperature
+        # Make the result 2D so we can concatenate across batch and other-sample dims.
+        cur_score = similarity_fn(query_emb, pos_emb)[None, None] / hparams.cl_temperature
         # GG_NOTE: compute the cos between the query and all negative results and stack
         # along last dimension
         for neg_emb in embeds["neg"]:
-            one_neg_score = (
-                similarity_fct(query_emb[None], neg_emb[None])[None] / hparams.cl_temperature
-            )
+            one_neg_score = similarity_fn(query_emb, neg_emb)[None, None] / hparams.cl_temperature
             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
 
         # And also add all positive examples from other elements in the batch
@@ -165,7 +178,7 @@ def get_loss(model, inputs, hparams):
                 continue
             other_pos_emb = embeds["pos"][other_batch_idx]
             one_neg_score = (
-                similarity_fct(pos_emb[None], other_pos_emb[None])[None] / hparams.cl_temperature
+                similarity_fn(pos_emb, other_pos_emb)[None, None] / hparams.cl_temperature
             )
             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
 
@@ -174,30 +187,55 @@ def get_loss(model, inputs, hparams):
             all_scores = cur_score
         else:
             all_scores = torch.cat([all_scores, cur_score], dim=0)
-    labels = torch.zeros(all_scores.size(0)).long().to(embeds["query"].device)
+    labels = torch.zeros(all_scores.size(0)).long().to(device)
     loss = F.cross_entropy(all_scores, labels)
+    if hparams.similarity_fn == "cos":
+        with torch.no_grad():
+            # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
+            # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
+            num_cat_all_scores = all_scores.shape[-1]
+            elems = torch.arange(num_cat_all_scores).to(device)
+            perfect_pred = torch.where(
+                elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
+            )
+            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=device).long())
+        loss -= perfect_loss.item()
 
     # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
     # where they also compute losses for "document-to-question matching".
     all_another_scores = None
     for batch_idx in range(batch_size):
         pos_emb, query_emb = embeds["pos"][batch_idx], embeds["query"][batch_idx]
-        cur_score = similarity_fct(pos_emb[None], query_emb[None])[None] / hparams.cl_temperature
+        cur_score = similarity_fn(pos_emb, query_emb)[None, None] / hparams.cl_temperature
 
         for other_batch_idx in range(batch_size):
             if other_batch_idx == batch_idx:
                 continue
-            other_query_emb = embeds["query"][other_batch_idx][None]
-            one_neg_score = similarity_fct(pos_emb, other_query_emb)[None] / hparams.cl_temperature
+            other_query_emb = embeds["query"][other_batch_idx]
+            one_neg_score = (
+                similarity_fn(pos_emb, other_query_emb)[None, None] / hparams.cl_temperature
+            )
             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
         if all_another_scores is None:
             all_another_scores = cur_score
         else:
             all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
-    labels_another = torch.zeros(all_another_scores.size(0)).long().to(embeds["query"].device)
+    labels_another = torch.zeros(all_another_scores.size(0)).long().to(device)
     loss += F.cross_entropy(all_another_scores, labels_another)
+    if hparams.similarity_fn == "cos":
+        with torch.no_grad():
+            # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
+            # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
+            num_cat_all_scores = all_another_scores.shape[-1]
+            elems = torch.arange(num_cat_all_scores).to(device)
+            perfect_pred = torch.where(
+                elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
+            )
+            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=device).long())
+        loss -= perfect_loss.item()
 
-    return loss
+    metrics = {"loss": loss}
+    return metrics
 
 
 def train_one_step():
@@ -208,12 +246,35 @@ def validate():
     pass
 
 
+def get_next_train_inputs(train_dataloader_dict, hparams):
+    """Randomly selects a category and returns the next item from the relevant dataloader."""
+    num_samples = sum(len(v) for v in train_dataloader_dict.values())
+    train_probs = {k: len(v) / num_samples for k, v in train_dataloader_dict.items()}
+    task_list, prob_list = [], []
+    for k, p in train_probs.items():
+        task_list.append(k)
+        prob_list.append(p)
+    rng = np.random.default_rng(hparams.seed)
+    iter_dict = {k: iter(v) for k, v in train_dataloader_dict.items()}
+
+    while True:
+        next_cat = rng.choice(task_list, p=prob_list)
+        data_iter = iter_dict[next_cat]
+        try:
+            yield next(data_iter)
+        except StopIteration:
+            iter_dict[next_cat] = iter(train_dataloader_dict[next_cat])
+            data_iter = iter_dict[next_cat]
+            yield next(data_iter)
+
+
 def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
     transformers.set_seed(hparams.seed)
     train_dataset_dict, val_dataset_dict = build_train_val_dataset_dicts(hparams)
     train_dataloader_dict, val_dataloader_dict = build_train_val_dataloaders_dict(
         train_dataset_dict, val_dataset_dict, hparams
     )
+
     small_loader = train_dataloader_dict["zeroshot"]
 
     train_losses = []
@@ -221,11 +282,12 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
 
     model, optimizer = build_model_and_optimizer(hparams)
     model.to("cuda")
-    for _ in range(hparams.epochs):
+    for _ in range(hparams.steps):
         model.train()
-        for inputs in small_loader:
+        for inputs in get_next_train_inputs(train_dataloader_dict, hparams):
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            loss = get_loss(model, inputs, hparams)
+            metrics = process_batch(model, inputs, hparams)
+            loss = metrics["loss"]
             loss.backward()
             train_losses.append(loss.item())
             optimizer.step()
@@ -234,7 +296,8 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
             if step % hparams.report_rate == 0:
                 mean_train_loss = np.array(train_losses).mean()
                 if RANK == 0:
-                    wandb.log({"step": step, "train_loss": mean_train_loss})
+                    if USE_WANDB:
+                        wandb.log({"step": step, "train_loss": mean_train_loss})
                     core_context.train.report_training_metrics(
                         steps_completed=step, metrics={"train_loss": mean_train_loss}
                     )
@@ -245,11 +308,13 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
             val_losses = []
             for inputs in val_dataloader_dict["zeroshot"]:
                 inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                loss = get_loss(model, inputs, hparams)
+                metrics = process_batch(model, inputs, hparams)
+                loss = metrics["loss"]
                 val_losses.append(loss.item())
             mean_val_loss = np.array(val_losses).mean()
             if RANK == 0:
-                wandb.log({"step": step, "val_loss": mean_val_loss})
+                if USE_WANDB:
+                    wandb.log({"step": step, "val_loss": mean_val_loss})
                 core_context.train.report_validation_metrics(
                     steps_completed=step, metrics={"val_loss": mean_val_loss}
                 )
@@ -267,10 +332,16 @@ if __name__ == "__main__":
     except KeyError:
         distributed = None
     with det.core.init(distributed=distributed) as core_context:
-        if os.environ.get("WANDB_API_KEY") and core_context.distributed.rank == 0:
+        if USE_WANDB and core_context.distributed.rank == 0:
             logging.info("Reporting results to wandb ... ")
             assert isinstance(hparams.model_name, str)
-            name = hparams.model_name + "_medi_train"
+            name = (
+                hparams.model_name + f"_bsz_{hparams.batch_size}"
+                f"_lr_{hparams.lr}"
+                + f"_strat_{hparams.embed_strat}"
+                + f"_temp_{hparams.cl_temperature}"
+                + f"_{hparams.similarity_fn}"
+            )
             run = wandb.init(
                 project="Embeddings",
                 config=dict(hparams),
