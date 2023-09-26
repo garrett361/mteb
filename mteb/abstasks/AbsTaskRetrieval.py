@@ -34,7 +34,13 @@ class AbsTaskRetrieval(AbsTask):
         return True
 
     def evaluate(
-        self, model, split="test", batch_size=128, corpus_chunk_size=None, score_function="cos_sim", **kwargs
+        self,
+        model,
+        split="test",
+        batch_size=128,
+        corpus_chunk_size=None,
+        score_function="cos_sim",
+        **kwargs
     ):
         logging.info(80 * "*")
         logging.info(f"In evaluate, using batch_size {batch_size}")
@@ -49,7 +55,11 @@ class AbsTaskRetrieval(AbsTask):
         if not self.data_loaded:
             self.load_data()
 
-        corpus, queries, relevant_docs = self.corpus[split], self.queries[split], self.relevant_docs[split]
+        corpus, queries, relevant_docs = (
+            self.corpus[split],
+            self.queries[split],
+            self.relevant_docs[split],
+        )
         if not self.is_dres_compatible(model):
             logging.info("Model not DRES compatible; initializing DRESModel")
             model = DRESModel(model, task_name=self.description["name"], **kwargs)
@@ -135,7 +145,9 @@ class DRESModel:
     def encode_queries(self, queries: List[str], batch_size: int, **kwargs):
         if self.use_sbert_model:
             if isinstance(self.model._first_module(), Transformer):
-                logger.info(f"Queries will be truncated to {self.model.get_max_seq_length()} tokens.")
+                logger.info(
+                    f"Queries will be truncated to {self.model.get_max_seq_length()} tokens."
+                )
             elif isinstance(self.model._first_module(), WordEmbeddings):
                 logger.warning(
                     "Queries will not be truncated. This could lead to memory issues. In that case please lower the batch_size."
@@ -150,6 +162,7 @@ class DRESModel:
             logging.info(f"Using instruction {instruction} for INSTRUCTOR query encoding")
             for s in queries:
                 # GG_NOTE: Why the zero at the end? Removing it does not seem to change anything.
+                # Also why not `join`?
                 new_sentences.append([instruction, s, 0])
             return self.model.encode(new_sentences, batch_size=batch_size, **kwargs)
         else:
@@ -166,7 +179,9 @@ class DRESModel:
                 ]
             else:
                 sentences = [
-                    (doc["title"] + self.sep + doc["text"]).strip() if "title" in doc else doc["text"].strip()
+                    (doc["title"] + self.sep + doc["text"]).strip()
+                    if "title" in doc
+                    else doc["text"].strip()
                     for doc in corpus
                 ]
             return self.model.encode(sentences, batch_size=batch_size, **kwargs)
@@ -180,7 +195,9 @@ class DRESModel:
                 ]
             else:
                 sentences = [
-                    (doc["title"] + " " + doc["text"]).strip() if "title" in doc else doc["text"].strip()
+                    (doc["title"] + " " + doc["text"]).strip()
+                    if "title" in doc
+                    else doc["text"].strip()
                     for doc in corpus
                 ]
             new_sentences = []
