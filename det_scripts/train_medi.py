@@ -133,19 +133,21 @@ def process_batch(model, inputs, hparams) -> Dict[str, Any]:
             embeds[k] = raw_model_outputs.last_hidden_state[
                 range(raw_model_outputs.last_hidden_state.shape[0]), attn_mask_sum
             ]
-        elif hparams.embed_strat == "weighted":
-            _, seq_len, _ = raw_model_outputs.last_hidden_state.shape
-            # Create the weights
-            linear_weigths = torch.arange(
-                start=1,
-                end=seq_len + 1,
-                dtype=raw_model_outputs.last_hidden_state.dtype,
-                device=raw_model_outputs.last_hidden_state.device,
-            ).flip(dims=(0,))[None, ..., None]
-            # Each weight needs to be weights by different values
-            weights /= weights.sum(dim=1)
-            logging.info("Using weights {weights}")
-            embeds[k] = raw_model_outputs.last_hidden_state * weights
+            return {"loss": embeds[k].sum()}
+        elif hparams.embed_strat == "weighed":
+            pass
+            # _, seq_len, _ = raw_model_outputs.last_hidden_state.shape
+            # # Create the weights
+            # linear_weigths = torch.arange(
+            #     start=1,
+            #     end=seq_len + 1,
+            #     dtype=raw_model_outputs.last_hidden_state.dtype,
+            #     device=raw_model_outputs.last_hidden_state.device,
+            # ).flip(dims=(0,))[None, ..., None]
+            # # Each weight needs to be weights by different values
+            # weights /= weights.sum(dim=1)
+            # logging.info("Using weights {weights}")
+            # embeds[k] = raw_model_outputs.last_hidden_state * weights
         else:
             raise ValueError(f"Recieved unexpected embed_strat: {hparams.embed_strat}")
 
@@ -198,51 +200,51 @@ def process_batch(model, inputs, hparams) -> Dict[str, Any]:
     assert all_scores is not None
     labels = torch.zeros(all_scores.size(0)).long().to(DEVICE)
     loss = F.cross_entropy(all_scores, labels)
-    if hparams.similarity_fn == "cos":
-        with torch.no_grad():
-            # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
-            # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
-            num_cat_all_scores = all_scores.shape[-1]
-            elems = torch.arange(num_cat_all_scores).to(DEVICE)
-            perfect_pred = torch.where(
-                elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
-            )
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
-        loss -= perfect_loss.item()
-
-    # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
-    # where they also compute losses for "document-to-question matching".
-    all_another_scores = None
-    for batch_idx in range(batch_size):
-        pos_emb, query_emb = embeds["pos"][batch_idx], embeds["query"][batch_idx]
-        cur_score = similarity_fn(pos_emb, query_emb)[None, None] / hparams.cl_temperature
-
-        for other_batch_idx in range(batch_size):
-            if other_batch_idx == batch_idx:
-                continue
-            other_query_emb = embeds["query"][other_batch_idx]
-            one_neg_score = (
-                similarity_fn(pos_emb, other_query_emb)[None, None] / hparams.cl_temperature
-            )
-            cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-        if all_another_scores is None:
-            all_another_scores = cur_score
-        else:
-            all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
-    assert all_another_scores is not None
-    labels_another = torch.zeros(all_another_scores.size(0)).long().to(DEVICE)
-    loss += F.cross_entropy(all_another_scores, labels_another)
-    if hparams.similarity_fn == "cos":
-        with torch.no_grad():
-            # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
-            # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
-            num_cat_all_scores = all_another_scores.shape[-1]
-            elems = torch.arange(num_cat_all_scores).to(DEVICE)
-            perfect_pred = torch.where(
-                elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
-            )
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
-        loss -= perfect_loss.item()
+    # if hparams.similarity_fn == "cos":
+    #     with torch.no_grad():
+    #         # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
+    #         # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
+    #         num_cat_all_scores = all_scores.shape[-1]
+    #         elems = torch.arange(num_cat_all_scores).to(DEVICE)
+    #         perfect_pred = torch.where(
+    #             elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
+    #         )
+    #         perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
+    #     loss -= perfect_loss.item()
+    #
+    # # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
+    # # where they also compute losses for "document-to-question matching".
+    # all_another_scores = None
+    # for batch_idx in range(batch_size):
+    #     pos_emb, query_emb = embeds["pos"][batch_idx], embeds["query"][batch_idx]
+    #     cur_score = similarity_fn(pos_emb, query_emb)[None, None] / hparams.cl_temperature
+    #
+    #     for other_batch_idx in range(batch_size):
+    #         if other_batch_idx == batch_idx:
+    #             continue
+    #         other_query_emb = embeds["query"][other_batch_idx]
+    #         one_neg_score = (
+    #             similarity_fn(pos_emb, other_query_emb)[None, None] / hparams.cl_temperature
+    #         )
+    #         cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
+    #     if all_another_scores is None:
+    #         all_another_scores = cur_score
+    #     else:
+    #         all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
+    # assert all_another_scores is not None
+    # labels_another = torch.zeros(all_another_scores.size(0)).long().to(DEVICE)
+    # loss += F.cross_entropy(all_another_scores, labels_another)
+    # if hparams.similarity_fn == "cos":
+    #     with torch.no_grad():
+    #         # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
+    #         # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
+    #         num_cat_all_scores = all_another_scores.shape[-1]
+    #         elems = torch.arange(num_cat_all_scores).to(DEVICE)
+    #         perfect_pred = torch.where(
+    #             elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
+    #         )
+    #         perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
+    #     loss -= perfect_loss.item()
 
     metrics = {"loss": loss}
     return metrics
@@ -309,6 +311,7 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
             logging.info(f"infnite input shapes: {shapes}")
         metrics = process_batch(model, inputs, hparams)
         loss = metrics["loss"]
+        # loss = model(**inputs["pos"]).last_hidden_state.sum()
         loss.backward()
         train_losses.append(loss.item())
         optimizer.step()
@@ -317,11 +320,9 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
         if step % hparams.report_rate == 0:
             mean_train_loss = torch.tensor(train_losses).mean()
             if WORLD_SIZE > 1:
-                mean_train_loss = (
-                    dist.reduce(mean_train_loss.to(DEVICE), op=dist.ReduceOp.SUM) / WORLD_SIZE
-                )
+                dist.reduce(mean_train_loss.to(DEVICE), dst=0, op=dist.ReduceOp.SUM)
             if RANK == 0:
-                train_metrics = {"train_loss": mean_train_loss.item()}
+                train_metrics = {"train_loss": mean_train_loss.item() / WORLD_SIZE}
                 if USE_WANDB:
                     wandb.log(
                         train_metrics,
@@ -348,11 +349,9 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
                     val_losses.append(loss.item())
                 mean_val_loss = torch.tensor(val_losses).mean()
                 if WORLD_SIZE > 1:
-                    mean_val_loss = (
-                        dist.reduce(mean_val_loss.to(DEVICE), op=dist.ReduceOp.SUM) / WORLD_SIZE
-                    )
+                    dist.reduce(mean_val_loss.to(DEVICE), dst=0, op=dist.ReduceOp.SUM)
                 if RANK == 0:
-                    val_metrics = {"val_loss": mean_val_loss.item()}
+                    val_metrics = {"val_loss": mean_val_loss.item() / WORLD_SIZE}
                     if USE_WANDB:
                         wandb.log(val_metrics, step=step)
                     core_context.train.report_validation_metrics(
