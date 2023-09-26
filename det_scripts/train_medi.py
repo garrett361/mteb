@@ -1,3 +1,5 @@
+import copy
+import itertools
 import logging
 import os
 from collections import defaultdict
@@ -8,6 +10,7 @@ import determined as det
 import numpy as np
 import omegaconf
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
@@ -18,6 +21,7 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 RANK = int(os.getenv("RANK", 0))
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
 USE_WANDB = WANDB_API_KEY is not None
+DEVICE = f"cuda:{RANK}"
 
 
 class TESTModel(nn.Module):
@@ -30,7 +34,7 @@ class TESTModel(nn.Module):
         for k, v in kwargs.items():
             setattr(self, k, v)
         if not hasattr(self, "device"):
-            self.device = "cuda"
+            self.device = DEVICE
 
     def forward(self, *args, **kwargs):
         return torch.randn(kwargs["input_ids"].shape[0], 128, device=self.device)
@@ -41,6 +45,7 @@ class TESTModel(nn.Module):
 
 def build_model_and_optimizer(hparams: omegaconf.OmegaConf):
     model = transformers.AutoModel.from_pretrained(hparams.model_name)
+    model.to(DEVICE)
     if WORLD_SIZE > 1:
         model = DDP(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=hparams.lr)
@@ -145,7 +150,6 @@ def process_batch(model, inputs, hparams) -> Dict[str, Any]:
             raise ValueError(f"Recieved unexpected embed_strat: {hparams.embed_strat}")
 
     batch_size, _ = embeds["query"].shape
-    device = embeds["query"].device
 
     all_scores = None
 
@@ -191,18 +195,19 @@ def process_batch(model, inputs, hparams) -> Dict[str, Any]:
             all_scores = cur_score
         else:
             all_scores = torch.cat([all_scores, cur_score], dim=0)
-    labels = torch.zeros(all_scores.size(0)).long().to(device)
+    assert all_scores is not None
+    labels = torch.zeros(all_scores.size(0)).long().to(DEVICE)
     loss = F.cross_entropy(all_scores, labels)
     if hparams.similarity_fn == "cos":
         with torch.no_grad():
             # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
             # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
             num_cat_all_scores = all_scores.shape[-1]
-            elems = torch.arange(num_cat_all_scores).to(device)
+            elems = torch.arange(num_cat_all_scores).to(DEVICE)
             perfect_pred = torch.where(
                 elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
             )
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=device).long())
+            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
         loss -= perfect_loss.item()
 
     # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
@@ -224,18 +229,19 @@ def process_batch(model, inputs, hparams) -> Dict[str, Any]:
             all_another_scores = cur_score
         else:
             all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
-    labels_another = torch.zeros(all_another_scores.size(0)).long().to(device)
+    assert all_another_scores is not None
+    labels_another = torch.zeros(all_another_scores.size(0)).long().to(DEVICE)
     loss += F.cross_entropy(all_another_scores, labels_another)
     if hparams.similarity_fn == "cos":
         with torch.no_grad():
             # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
             # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
             num_cat_all_scores = all_another_scores.shape[-1]
-            elems = torch.arange(num_cat_all_scores).to(device)
+            elems = torch.arange(num_cat_all_scores).to(DEVICE)
             perfect_pred = torch.where(
                 elems > 0, -1.0 / hparams.cl_temperature, 1.0 / hparams.cl_temperature
             )
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=device).long())
+            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
         loss -= perfect_loss.item()
 
     metrics = {"loss": loss}
@@ -262,14 +268,24 @@ def build_infinite_data_iterator(train_dataloader_dict, hparams):
     rng = np.random.default_rng(hparams.seed)
     iter_dict = {k: iter(v) for k, v in train_dataloader_dict.items()}
 
+    # Use a single small sub-dataset when debugging
     while True:
         next_cat = rng.choice(task_list, p=prob_list)
-        data_iter = iter_dict[next_cat]
+        data_iter = (
+            iter_dict[next_cat]
+            if not hparams.get("debug")
+            else iter(train_dataloader_dict["zeroshot"])
+        )
+
         try:
             yield next(data_iter)
         except StopIteration:
             iter_dict[next_cat] = iter(train_dataloader_dict[next_cat])
-            data_iter = iter_dict[next_cat]
+            data_iter = (
+                iter_dict[next_cat]
+                if not hparams.get("debug")
+                else iter(train_dataloader_dict["zeroshot"])
+            )
             yield next(data_iter)
 
 
@@ -280,19 +296,17 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
         train_dataset_dict, val_dataset_dict, hparams
     )
 
-    small_loader = train_dataloader_dict["zeroshot"]
-
     train_losses = []
     step = 0
 
     model, optimizer = build_model_and_optimizer(hparams)
-    model.to("cuda")
     data_iter = build_infinite_data_iterator(train_dataloader_dict, hparams)
-    for _ in range(hparams.steps):
+    while step < hparams.steps:
         model.train()
-        inputs = {k: v.to("cuda") for k, v in next(data_iter).items()}
+        inputs = {k: v.to(DEVICE) for k, v in next(data_iter).items()}
         shapes = {k: {kk: t.shape for kk, t in v.items()} for k, v in inputs.items()}
-        logging.info(f"infnite input shapes: {shapes}")
+        if hparams.get("debug"):
+            logging.info(f"infnite input shapes: {shapes}")
         metrics = process_batch(model, inputs, hparams)
         loss = metrics["loss"]
         loss.backward()
@@ -301,30 +315,49 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
         step += 1
         optimizer.zero_grad(set_to_none=True)
         if step % hparams.report_rate == 0:
-            mean_train_loss = np.array(train_losses).mean()
+            mean_train_loss = torch.tensor(train_losses).mean()
+            if WORLD_SIZE > 1:
+                mean_train_loss = (
+                    dist.reduce(mean_train_loss.to(DEVICE), op=dist.ReduceOp.SUM) / WORLD_SIZE
+                )
             if RANK == 0:
+                train_metrics = {"train_loss": mean_train_loss.item()}
                 if USE_WANDB:
-                    wandb.log({"step": step, "train_loss": mean_train_loss})
+                    wandb.log(
+                        train_metrics,
+                        step=step,
+                    )
                 core_context.train.report_training_metrics(
-                    steps_completed=step, metrics={"train_loss": mean_train_loss}
+                    steps_completed=step, metrics=train_metrics
                 )
             train_losses = []
 
-    model.eval()
-    with torch.no_grad():
-        val_losses = []
-        for inputs in val_dataloader_dict["zeroshot"]:
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            metrics = process_batch(model, inputs, hparams)
-            loss = metrics["loss"]
-            val_losses.append(loss.item())
-        mean_val_loss = np.array(val_losses).mean()
-        if RANK == 0:
-            if USE_WANDB:
-                wandb.log({"step": step, "val_loss": mean_val_loss})
-            core_context.train.report_validation_metrics(
-                steps_completed=step, metrics={"val_loss": mean_val_loss}
-            )
+        if step % hparams.val_rate == 0:
+            model.eval()
+            with torch.no_grad():
+                val_losses = []
+                val_data_iter = (
+                    val_dataloader_dict["zeroshot"]
+                    if hparams.debug
+                    else itertools.chain(val_dataloader_dict.values())
+                )
+                for inputs in val_data_iter:
+                    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                    metrics = process_batch(model, inputs, hparams)
+                    loss = metrics["loss"]
+                    val_losses.append(loss.item())
+                mean_val_loss = torch.tensor(val_losses).mean()
+                if WORLD_SIZE > 1:
+                    mean_val_loss = (
+                        dist.reduce(mean_val_loss.to(DEVICE), op=dist.ReduceOp.SUM) / WORLD_SIZE
+                    )
+                if RANK == 0:
+                    val_metrics = {"val_loss": mean_val_loss.item()}
+                    if USE_WANDB:
+                        wandb.log(val_metrics, step=step)
+                    core_context.train.report_validation_metrics(
+                        steps_completed=step, metrics=val_metrics
+                    )
 
 
 if __name__ == "__main__":
@@ -349,9 +382,13 @@ if __name__ == "__main__":
                 + f"_temp_{hparams.cl_temperature}"
                 + f"_{hparams.similarity_fn}"
             )
+            config = copy.deepcopy(dict(hparams))
+            config["exp_id"] = info.trial.experiment_id
+            config["trial_id"] = info.trial.trial_id
+            config["world_size"] = WORLD_SIZE
             run = wandb.init(
                 project="Embeddings",
-                config=dict(hparams),
+                config=config,
                 name=name,
                 job_type="medi_train",
                 tags=["train"],
