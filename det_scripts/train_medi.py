@@ -75,7 +75,11 @@ def build_train_val_dataloaders_dict(
                 examples_dict[k].append(example[k])
         inputs_dict = {
             key: tokenizer(
-                examples_dict[key], return_tensors="pt", padding=True, return_attention_mask=True
+                examples_dict[key],
+                return_tensors="pt",
+                padding=True,
+                return_attention_mask=True,
+                truncation=True,
             )
             for key in examples_dict
         }
@@ -246,7 +250,7 @@ def validate():
     pass
 
 
-def get_next_train_inputs(train_dataloader_dict, hparams):
+def build_infinite_data_iterator(train_dataloader_dict, hparams):
     """Randomly selects a category and returns the next item from the relevant dataloader."""
     num_samples = sum(len(v) for v in train_dataloader_dict.values())
     train_probs = {k: len(v) / num_samples for k, v in train_dataloader_dict.items()}
@@ -254,6 +258,7 @@ def get_next_train_inputs(train_dataloader_dict, hparams):
     for k, p in train_probs.items():
         task_list.append(k)
         prob_list.append(p)
+    # GG_TODO: Restore random state after restart
     rng = np.random.default_rng(hparams.seed)
     iter_dict = {k: iter(v) for k, v in train_dataloader_dict.items()}
 
@@ -282,42 +287,44 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
 
     model, optimizer = build_model_and_optimizer(hparams)
     model.to("cuda")
+    data_iter = build_infinite_data_iterator(train_dataloader_dict, hparams)
     for _ in range(hparams.steps):
         model.train()
-        for inputs in get_next_train_inputs(train_dataloader_dict, hparams):
+        inputs = {k: v.to("cuda") for k, v in next(data_iter).items()}
+        shapes = {k: {kk: t.shape for kk, t in v.items()} for k, v in inputs.items()}
+        logging.info(f"infnite input shapes: {shapes}")
+        metrics = process_batch(model, inputs, hparams)
+        loss = metrics["loss"]
+        loss.backward()
+        train_losses.append(loss.item())
+        optimizer.step()
+        step += 1
+        optimizer.zero_grad(set_to_none=True)
+        if step % hparams.report_rate == 0:
+            mean_train_loss = np.array(train_losses).mean()
+            if RANK == 0:
+                if USE_WANDB:
+                    wandb.log({"step": step, "train_loss": mean_train_loss})
+                core_context.train.report_training_metrics(
+                    steps_completed=step, metrics={"train_loss": mean_train_loss}
+                )
+            train_losses = []
+
+    model.eval()
+    with torch.no_grad():
+        val_losses = []
+        for inputs in val_dataloader_dict["zeroshot"]:
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
             metrics = process_batch(model, inputs, hparams)
             loss = metrics["loss"]
-            loss.backward()
-            train_losses.append(loss.item())
-            optimizer.step()
-            step += 1
-            optimizer.zero_grad(set_to_none=True)
-            if step % hparams.report_rate == 0:
-                mean_train_loss = np.array(train_losses).mean()
-                if RANK == 0:
-                    if USE_WANDB:
-                        wandb.log({"step": step, "train_loss": mean_train_loss})
-                    core_context.train.report_training_metrics(
-                        steps_completed=step, metrics={"train_loss": mean_train_loss}
-                    )
-                train_losses = []
-
-        model.eval()
-        with torch.no_grad():
-            val_losses = []
-            for inputs in val_dataloader_dict["zeroshot"]:
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                metrics = process_batch(model, inputs, hparams)
-                loss = metrics["loss"]
-                val_losses.append(loss.item())
-            mean_val_loss = np.array(val_losses).mean()
-            if RANK == 0:
-                if USE_WANDB:
-                    wandb.log({"step": step, "val_loss": mean_val_loss})
-                core_context.train.report_validation_metrics(
-                    steps_completed=step, metrics={"val_loss": mean_val_loss}
-                )
+            val_losses.append(loss.item())
+        mean_val_loss = np.array(val_losses).mean()
+        if RANK == 0:
+            if USE_WANDB:
+                wandb.log({"step": step, "val_loss": mean_val_loss})
+            core_context.train.report_validation_metrics(
+                steps_completed=step, metrics={"val_loss": mean_val_loss}
+            )
 
 
 if __name__ == "__main__":
