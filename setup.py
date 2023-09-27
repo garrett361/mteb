@@ -87,6 +87,7 @@ setup(
         "InstructorEmbedding==1.0.1",
         "pytorch-extension==0.2",
         "omegaconf==2.3.0",
+        "einops==0.6.1",
     ],
     extras_require=extras,
     classifiers=[

@@ -23,6 +23,7 @@ WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
 USE_WANDB = WANDB_API_KEY is not None
 DEVICE = f"cuda:{RANK}"
 
+Script for training decoder-only models on the medi dataset
 
 class TESTModel(nn.Module):
     """
