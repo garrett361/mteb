@@ -18,6 +18,9 @@ import transformers
 import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+import mteb
 
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 RANK = int(os.getenv("RANK", 0))
@@ -55,20 +58,16 @@ class TESTModel(nn.Module):
         return torch.randn(len(sentences), 128, device=self.device)
 
 
-def build_model_and_optimizer(hparams: omegaconf.OmegaConf):
-    model = transformers.AutoModel.from_pretrained(
-        hparams.model_name, trust_remote_code=hparams.model_name == "tiiuae/falcon-7b"
-    )
-    if model.config._name_or_path in ("mosaicml/mpt-7b", "tiiuae/falcon-7b"):
-        logging.info("Freezing mpt")
-        for n, p in model.named_parameters():
-            if n.split(".")[1] != "31":
-                logging.info(f"Freezing {n}")
-                p.requires_grad = False
+def build_model_and_optimizer(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
+    model = mteb.models.DetInstructor(hparams, core_context)
     model.to(DEVICE)
     if WORLD_SIZE > 1:
         model = DDP(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=hparams.lr)
+    if hparams.get("load_from_uuid"):
+        with core_context.checkpoint.restore_path(hparams.load_from_uuid) as path:
+            logging.info(f"Loading optimizer state from {hparams.load_from_uuid}")
+            optimizer.load_state_dict(torch.load(path.joinpath("optim.pt")))
     return model, optimizer
 
 
@@ -76,15 +75,6 @@ def build_train_val_dataset_dicts(hparams: omegaconf.OmegaConf):
     train_dataset_dict = datasets.load_dataset(hparams.train_dataset)
     val_dataset_dict = datasets.load_dataset(hparams.val_dataset)
     return train_dataset_dict, val_dataset_dict
-
-
-def build_tokenizer():
-    tokenizer_name = hparams.get("tokenizer_name") or hparams.model_name
-    tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.paddding_side = "right"
-    return tokenizer
 
 
 def build_train_val_dataloaders_dict(
@@ -148,32 +138,7 @@ def save_model():
 
 
 def process_batch(model, inputs, hparams, tokenizer) -> Dict[str, Any]:
-    embeds = {}
-    keys: List[str] = ["query", "pos", "neg"]
-    for k in keys:
-        raw_model_outputs = model(**inputs[k])
-        if hparams.embed_strat == "last":
-            # Need to take the final state according to the attention masks
-            attn_mask_sum = inputs[k]["attention_mask"].sum(dim=-1) - 1
-            last_hidden_state = raw_model_outputs.last_hidden_state
-            embeds[k] = last_hidden_state[range(last_hidden_state.shape[0]), attn_mask_sum]
-        elif hparams.embed_strat == "weighed":
-            pass
-            # _, seq_len, _ = raw_model_outputs.last_hidden_state.shape
-            # # Create the weights
-            # linear_weigths = torch.arange(
-            #     start=1,
-            #     end=seq_len + 1,
-            #     dtype=raw_model_outputs.last_hidden_state.dtype,
-            #     device=raw_model_outputs.last_hidden_state.device,
-            # ).flip(dims=(0,))[None, ..., None]
-            # # Each weight needs to be weights by different values
-            # weights /= weights.sum(dim=1)
-            # logging.info("Using weights {weights}")
-            # embeds[k] = raw_model_outputs.last_hidden_state * weights
-        else:
-            raise ValueError(f"Recieved unexpected embed_strat: {hparams.embed_strat}")
-
+    embeds = model(inputs)
     batch_size, _ = embeds["query"].shape
 
     all_scores = None
@@ -224,16 +189,15 @@ def process_batch(model, inputs, hparams, tokenizer) -> Dict[str, Any]:
     if hparams.similarity_fn == "cos":
         with torch.no_grad():
             # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
-            # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
-            num_cat_all_scores = all_scores.shape[-1]
-            perfect_pred = -1.0 * torch.ones(num_cat_all_scores).to(DEVICE) / hparams.temp
-            perfect_pred[0] = 1.0 / hparams.temp
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
+            # For convenience subtract a constant to make the minimum zero.
+            perfect_pred = -1.0 * torch.ones_like(all_scores) / hparams.temp
+            perfect_pred[:, 0] = 1.0 / hparams.temp
+            perfect_loss = F.cross_entropy(perfect_pred, labels)
         loss = loss - perfect_loss.item()
 
     # GG_NOTE: Also use the "bi-directional in-batch" loss of Ni et al. 2021 2112.07899
     # where they also compute losses for "document-to-question matching".
-    all_another_scores = None
+    all_bidirectional_scores = None
     for batch_idx in range(batch_size):
         pos_emb, query_emb = embeds["pos"][batch_idx], embeds["query"][batch_idx]
         cur_score = similarity_fn(pos_emb, query_emb)[None, None] / hparams.temp
@@ -244,22 +208,25 @@ def process_batch(model, inputs, hparams, tokenizer) -> Dict[str, Any]:
             other_query_emb = embeds["query"][other_batch_idx]
             one_neg_score = similarity_fn(pos_emb, other_query_emb)[None, None] / hparams.temp
             cur_score = torch.cat([cur_score, one_neg_score], dim=-1)
-        if all_another_scores is None:
-            all_another_scores = cur_score
+        if all_bidirectional_scores is None:
+            all_bidirectional_scores = cur_score
         else:
-            all_another_scores = torch.cat([all_another_scores, cur_score], dim=0)
-    assert all_another_scores is not None
-    labels_another = torch.zeros(all_another_scores.size(0)).long().to(DEVICE)
-    loss = loss + F.cross_entropy(all_another_scores, labels_another)
+            all_bidirectional_scores = torch.cat([all_bidirectional_scores, cur_score], dim=0)
+    assert all_bidirectional_scores is not None
+    labels_bidirectional = torch.zeros(all_bidirectional_scores.size(0)).long().to(DEVICE)
+    loss = loss + F.cross_entropy(all_bidirectional_scores, labels_bidirectional)
     if hparams.similarity_fn == "cos":
         with torch.no_grad():
             # In the cosine strategy, the minimum possible loss is not zero, when defined as above.
             # For convenience subtract a (batch-size-dependent) constant to make the minimum zero.
-            num_cat_all_scores = all_another_scores.shape[-1]
-            elems = torch.arange(num_cat_all_scores).to(DEVICE)
-            perfect_pred = torch.where(elems > 0, -1.0 / hparams.temp, 1.0 / hparams.temp)
-            perfect_loss = F.cross_entropy(perfect_pred[None], torch.zeros(1, device=DEVICE).long())
-        loss = loss - perfect_loss.item()
+            perfect_pred_bidirectional = (
+                -1.0 * torch.ones_like(all_bidirectional_scores) / hparams.temp
+            )
+            perfect_pred_bidirectional[:, 0] = 1.0 / hparams.temp
+            perfect_loss_bidirectional = F.cross_entropy(
+                perfect_pred_bidirectional, labels_bidirectional
+            )
+        loss = loss - perfect_loss_bidirectional.item()
 
     metrics = {"loss": loss}
     return metrics
@@ -287,50 +254,42 @@ def train_one_step(model, tokenizer, train_data_iter, optimizer, scaler=None) ->
     return metrics
 
 
-def build_infinite_train_data_iterator(train_dataloader_dict, hparams):
+def build_infinite_data_iterator(dataloader_dict, hparams):
     """Randomly selects a category and returns the next item from the relevant dataloader."""
-    num_samples = sum(len(v) for v in train_dataloader_dict.values())
-    train_probs = {k: len(v) / num_samples for k, v in train_dataloader_dict.items()}
+    num_samples = sum(len(v) for v in dataloader_dict.values())
+    train_probs = {k: len(v) / num_samples for k, v in dataloader_dict.items()}
     task_list, prob_list = [], []
     for k, p in train_probs.items():
         task_list.append(k)
         prob_list.append(p)
     # GG_TODO: Restore random state after restart
     rng = np.random.default_rng(hparams.seed)
-    iter_dict = {k: iter(v) for k, v in train_dataloader_dict.items()}
+    iter_dict = {k: iter(v) for k, v in dataloader_dict.items()}
 
     # Use a single small sub-dataset when debugging
     while True:
         next_cat = rng.choice(task_list, p=prob_list)
-        data_iter = (
-            iter_dict[next_cat]
-            if not hparams.get("debug")
-            else iter(train_dataloader_dict[DEBUG_TASK])
-        )
+        data_iter = iter_dict[next_cat]
 
         try:
             yield next(data_iter)
         except StopIteration:
-            iter_dict[next_cat] = iter(train_dataloader_dict[next_cat])
-            data_iter = (
-                iter_dict[next_cat]
-                if not hparams.get("debug")
-                else iter(train_dataloader_dict[DEBUG_TASK])
-            )
+            iter_dict[next_cat] = iter(dataloader_dict[next_cat])
+            data_iter = iter_dict[next_cat]
             yield next(data_iter)
 
 
-def validate(model, tokenizer, val_dataloader_dict, hparams) -> Optional[Dict[str, Any]]:
+def validate(model, tokenizer, val_data_iter, hparams) -> Optional[Dict[str, Any]]:
     model.eval()
     with torch.no_grad():
         all_val_metrics = defaultdict(list)
-        for task, val_data_iter in val_dataloader_dict.items():
-            if (hparams.debug and task == DEBUG_TASK) or not hparams.debug:
-                for inputs in tqdm(val_data_iter, desc=f"Validating task {task}"):
-                    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                    metrics = process_batch(model, inputs, hparams, tokenizer)
-                    for k, v in metrics.items():
-                        all_val_metrics[k].append(v.item())
+        max_val_steps = hparams.val_steps if not hparams.debug else DEBUG_STEPS
+        for val_step in tqdm(range(max_val_steps), desc="Validating"):
+            inputs = next(val_data_iter)
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+            metrics = process_batch(model, inputs, hparams, tokenizer)
+            for k, v in metrics.items():
+                all_val_metrics[k].append(v.item())
         mean_val_metrics = {k: torch.tensor(v).mean() for k, v in all_val_metrics.items()}
         if WORLD_SIZE > 1:
             for v in mean_val_metrics.values():
@@ -360,6 +319,13 @@ def reduce_and_report_train_metrics(
         )
 
 
+def save_model_and_optimizer(model, optimizer, core_context: det.core.Context, step: int) -> None:
+    metadata = {"steps_completed": step}
+    with core_context.checkpoint.store_path(metadata) as (path, storage_id):
+        torch.save(optimizer.state_dict(), path.joinpath("optim.pt"))
+        model.save_pretrained(path)
+
+
 def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
     if hparams.debug:
         torch.autograd.set_detect_anomaly(True)
@@ -367,22 +333,24 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
     scaler = torch.cuda.amp.GradScaler() if hparams.amp else None
 
     transformers.set_seed(hparams.seed)
-    tokenizer = build_tokenizer()
+
+    model, optimizer = build_model_and_optimizer(hparams, core_context)
+
     train_dataset_dict, val_dataset_dict = build_train_val_dataset_dicts(hparams)
     train_dataloader_dict, val_dataloader_dict = build_train_val_dataloaders_dict(
-        tokenizer, train_dataset_dict, val_dataset_dict, hparams
+        model.hf_tokenizer, train_dataset_dict, val_dataset_dict, hparams
     )
 
     train_metrics_collected = defaultdict(list)
     step = 0
 
-    model, optimizer = build_model_and_optimizer(hparams)
-    train_data_iter = build_infinite_train_data_iterator(train_dataloader_dict, hparams)
+    train_data_iter = build_infinite_data_iterator(train_dataloader_dict, hparams)
+    val_data_iter = build_infinite_data_iterator(val_dataloader_dict, hparams)
     max_steps = DEBUG_STEPS if hparams.debug else hparams.steps
     for step in tqdm(range(1, max_steps + 1), desc="Training"):
         train_step_metrics = train_one_step(
             model=model,
-            tokenizer=tokenizer,
+            tokenizer=model.hf_tokenizer,
             train_data_iter=train_data_iter,
             optimizer=optimizer,
             scaler=scaler,
@@ -400,11 +368,13 @@ def main(hparams: omegaconf.OmegaConf, core_context: det.core.Context):
 
         val_rate = DEBUG_STEPS if hparams.debug else hparams.val_rate
         if step % val_rate == 0:
+            if RANK == 0:
+                save_model_and_optimizer(model, optimizer, core_context, step)
             # Only RANK == 0 will get the fully reduced metrics, others get None.
             val_metrics = validate(
                 model=model,
-                tokenizer=tokenizer,
-                val_dataloader_dict=val_dataloader_dict,
+                tokenizer=model.hf_tokenizer,
+                val_data_iter=val_data_iter,
                 hparams=hparams,
             )
             if RANK == 0:
@@ -426,27 +396,28 @@ if __name__ == "__main__":
         torch.distributed.init_process_group("nccl")
     except KeyError:
         distributed = None
-    with det.core.init(distributed=distributed) as core_context:
-        if USE_WANDB and core_context.distributed.rank == 0:
-            logging.info("Reporting results to wandb ... ")
-            assert isinstance(hparams.model_name, str)
-            name = (
-                hparams.model_name + f"_bsz_{hparams.batch_size}"
-                f"_lr_{hparams.lr}"
-                + f"_strat_{hparams.embed_strat}"
-                + f"_temp_{hparams.temp}"
-                + f"_{hparams.similarity_fn}"
-            )
-            config = copy.deepcopy(dict(hparams))
-            config["exp_id"] = info.trial.experiment_id
-            config["trial_id"] = info.trial.trial_id
-            config["world_size"] = WORLD_SIZE
-            run = wandb.init(
-                project="Embeddings",
-                config=config,
-                name=name,
-                job_type="medi_train",
-                tags=["train"],
-            )
 
-        main(hparams, core_context)
+    with logging_redirect_tqdm():
+        with det.core.init(distributed=distributed) as core_context:
+            if USE_WANDB and core_context.distributed.rank == 0:
+                logging.info("Reporting results to wandb ... ")
+                assert isinstance(hparams.model_name, str)
+                name = (
+                    hparams.model_name + f"_bsz_{hparams.batch_size}"
+                    f"_lr_{hparams.lr}"
+                    + f"_strat_{hparams.embed_strat}"
+                    + f"_temp_{hparams.temp}"
+                    + f"_{hparams.similarity_fn}"
+                )
+                config = copy.deepcopy(dict(hparams))
+                config["exp_id"] = info.trial.experiment_id
+                config["trial_id"] = info.trial.trial_id
+                config["world_size"] = WORLD_SIZE
+                run = wandb.init(
+                    project="Embeddings",
+                    config=config,
+                    name=name,
+                    job_type="medi_train",
+                    tags=["train"],
+                )
+            main(hparams, core_context)
