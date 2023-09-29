@@ -205,7 +205,7 @@ class DRESModel:
             logging.info(f"Using instruction {instruction} for INSTRUCTOR corpus encoding")
             for s in sentences:
                 new_sentences.append([instruction, s, 0])
-            return self.model.encode(sentences, batch_size=128, **kwargs)
+            return self.model.encode(sentences, batch_size=batch_size, **kwargs)
         else:
             raise ValueError(f"Unexpected model type: {self.model_type}")
 

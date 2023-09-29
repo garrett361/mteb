@@ -43,7 +43,13 @@ def main(hparams: Dict[str, Any], core_context: det.core.Context) -> None:
         model_type in MODEL_TYPE_DICT
     ), f"Expected model_type to be in {list(MODEL_TYPE_DICT)} received {model_type}"
 
-    model = MODEL_TYPE_DICT[model_type](model_name, device=device)
+    if hparams.get("load_from_uuid"):
+        with core_context.checkpoint.restore_path(hparams["load_from_uuid"]) as path:
+            logging.info(f"Loading model from checkpoint {hparams['load_from_uuid']}")
+            model = MODEL_TYPE_DICT[model_type](path, device=device)
+            model_name += f"_{hparams['load_from_uuid']}"
+    else:
+        model = MODEL_TYPE_DICT[model_type](model_name, device=device)
     evaluation = MTEB(
         tasks=hparams.get("tasks"),
         task_types=hparams.get("task_types"),

@@ -63,6 +63,8 @@ def build_model_and_optimizer(hparams: omegaconf.OmegaConf, core_context: det.co
     model.to(DEVICE)
     if WORLD_SIZE > 1:
         model = DDP(model)
+        model.hf_tokenizer = model.module.hf_tokenizer
+        model.save_pretrained = model.module.save_pretrained
     optimizer = torch.optim.AdamW(model.parameters(), lr=hparams.lr)
     if hparams.get("load_from_uuid"):
         with core_context.checkpoint.restore_path(hparams.load_from_uuid) as path:
@@ -237,7 +239,7 @@ def train_one_step(model, tokenizer, train_data_iter, optimizer, scaler=None) ->
     inputs = {k: v.to(DEVICE) for k, v in next(train_data_iter).items()}
     if hparams.get("debug"):
         shapes = {k: {kk: t.shape for kk, t in v.items()} for k, v in inputs.items()}
-        logging.info(f"infnite input shapes: {shapes}")
+        logging.info(f"input shapes: {shapes}")
     train_context = (
         torch.autocast(device_type="cuda", dtype=torch.float16) if hparams.amp else nullcontext()
     )
@@ -405,7 +407,7 @@ if __name__ == "__main__":
                 name = (
                     hparams.model_name + f"_bsz_{hparams.batch_size}"
                     f"_lr_{hparams.lr}"
-                    + f"_strat_{hparams.embed_strat}"
+                    + f"_strat_{hparams.pooling_mode}"
                     + f"_temp_{hparams.temp}"
                     + f"_{hparams.similarity_fn}"
                 )
